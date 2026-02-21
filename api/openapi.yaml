@@ -1,0 +1,282 @@
+openapi: 3.0.3
+info:
+  title: Google Maps Scraper API
+  description: |
+    Scrape Google Maps for business listings, reviews, contact info, coordinates, and more.
+    Jobs run asynchronously - submit a scrape request, then poll for results.
+  version: 1.0.0
+  contact:
+    name: API Support
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /api/v1/scrape:
+    post:
+      summary: Start a scrape job
+      description: |
+        Submit a search query or Google Maps URL for scraping.
+        Returns a job ID to poll for results.
+      operationId: startScrape
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                searchTerms:
+                  type: array
+                  items:
+                    type: string
+                  description: Search terms (e.g., ["pizza", "sushi"])
+                  example: ["Italian Restaurant"]
+                location:
+                  type: string
+                  description: Location for search (required with searchTerms)
+                  example: "New York, USA"
+                directUrls:
+                  type: array
+                  items:
+                    type: string
+                  description: Direct Google Maps URLs to scrape
+                maxResults:
+                  type: integer
+                  default: 120
+                  minimum: 1
+                  maximum: 500
+                  description: Max results per search term
+                language:
+                  type: string
+                  default: en
+                  description: Language code for results
+                scrapeReviews:
+                  type: boolean
+                  default: true
+                  description: Include individual reviews
+                reviewsLimit:
+                  type: integer
+                  default: 5
+                  description: Max reviews per place
+                scrapeOpeningHours:
+                  type: boolean
+                  default: true
+                  description: Include opening hours
+                minRating:
+                  type: number
+                  minimum: 0
+                  maximum: 5
+                  description: Filter by minimum rating
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [queued]
+                  message:
+                    type: string
+        '400':
+          description: Invalid input
+        '401':
+          description: Missing or invalid API key
+        '429':
+          description: Rate limit exceeded
+
+  /api/v1/jobs/{jobId}:
+    get:
+      summary: Get job status and results
+      operationId: getJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [queued, running, completed, failed]
+                  progress:
+                    type: object
+                    properties:
+                      current:
+                        type: integer
+                      total:
+                        type: integer
+                      message:
+                        type: string
+                  resultCount:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Place'
+                  error:
+                    type: string
+                    nullable: true
+                  createdAt:
+                    type: string
+                    format: date-time
+                  completedAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+        '404':
+          description: Job not found
+
+  /api/v1/jobs/{jobId}/export/{format}:
+    get:
+      summary: Export job results
+      operationId: exportJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [json, csv, xlsx]
+      responses:
+        '200':
+          description: File download
+        '400':
+          description: Job not completed or unsupported format
+        '404':
+          description: Job not found
+
+  /api/v1/jobs:
+    get:
+      summary: List recent jobs
+      operationId: listJobs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Job list
+
+  /api/v1/health:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      security: []
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  uptime:
+                    type: integer
+                  timestamp:
+                    type: string
+                  activeJobs:
+                    type: integer
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    Place:
+      type: object
+      properties:
+        placeName:
+          type: string
+        url:
+          type: string
+        placeId:
+          type: string
+        category:
+          type: string
+        totalReviewScore:
+          type: number
+          nullable: true
+        reviewCount:
+          type: integer
+        phoneNumber:
+          type: string
+        website:
+          type: string
+        address:
+          type: object
+          properties:
+            street:
+              type: string
+            city:
+              type: string
+            state:
+              type: string
+            postalCode:
+              type: string
+            fullAddress:
+              type: string
+        coordinates:
+          type: object
+          nullable: true
+          properties:
+            latitude:
+              type: number
+            longitude:
+              type: number
+        openingHours:
+          type: object
+          nullable: true
+        reviews:
+          type: array
+          items:
+            type: object
+            properties:
+              author:
+                type: string
+              rating:
+                type: number
+              text:
+                type: string
+              publishedDate:
+                type: string
+        scrapedAt:
+          type: string
+          format: date-time

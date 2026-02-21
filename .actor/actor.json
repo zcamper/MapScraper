@@ -1,0 +1,47 @@
+{
+    "actorSpecification": 1,
+    "name": "google-maps-scraper",
+    "title": "Google Maps Scraper & Extractor",
+    "description": "Scrape Google Maps search results with reviews, opening hours, contact info, coordinates, and more. Pay only for what you scrape.",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "environmentVariables": {},
+    "dockerfile": "./Dockerfile",
+    "input": "./INPUT_SCHEMA.json",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "title": "Scraped Places",
+            "views": {
+                "places": {
+                    "title": "Places",
+                    "transformation": {
+                        "fields": [
+                            "placeName",
+                            "category",
+                            "totalReviewScore",
+                            "reviewCount",
+                            "phoneNumber",
+                            "website",
+                            "address",
+                            "coordinates",
+                            "openingHours",
+                            "url"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {
+                            "placeName": { "label": "Name", "format": "text" },
+                            "category": { "label": "Category", "format": "text" },
+                            "totalReviewScore": { "label": "Rating", "format": "number" },
+                            "reviewCount": { "label": "Reviews", "format": "number" },
+                            "phoneNumber": { "label": "Phone", "format": "text" },
+                            "website": { "label": "Website", "format": "link" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

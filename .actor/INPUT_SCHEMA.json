@@ -1,0 +1,94 @@
+{
+    "title": "Google Maps Scraper Input",
+    "description": "Configure your Google Maps scraping job. Provide search terms with a location, or direct Google Maps URLs.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchTerms": {
+            "title": "Search Terms",
+            "type": "array",
+            "description": "List of search terms to look up on Google Maps (e.g., 'Italian Restaurant', 'Dentist', 'Hotel')",
+            "editor": "stringList",
+            "prefill": ["restaurant"],
+            "sectionCaption": "Search Configuration",
+            "sectionDescription": "Define what and where to search. Use either search terms + location, or direct URLs."
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "City, region, or country to search in (e.g., 'New York, USA', 'London, UK')",
+            "editor": "textfield",
+            "prefill": "New York, USA"
+        },
+        "directUrls": {
+            "title": "Direct Google Maps URLs",
+            "type": "array",
+            "description": "Direct Google Maps search or place URLs to scrape (alternative to search terms + location)",
+            "editor": "stringList"
+        },
+        "maxResults": {
+            "title": "Max Results Per Search",
+            "type": "integer",
+            "description": "Maximum number of places to scrape per search term",
+            "default": 120,
+            "minimum": 1,
+            "maximum": 500,
+            "sectionCaption": "Scraping Options"
+        },
+        "language": {
+            "title": "Language",
+            "type": "string",
+            "description": "Language for Google Maps results",
+            "default": "en",
+            "editor": "select",
+            "enum": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh-CN", "zh-TW", "ar", "ru", "nl", "pl", "tr", "th", "vi", "id", "cs", "sv", "da", "fi", "no", "hu", "ro", "uk", "el", "he"],
+            "enumTitles": ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Japanese", "Korean", "Chinese (Simplified)", "Chinese (Traditional)", "Arabic", "Russian", "Dutch", "Polish", "Turkish", "Thai", "Vietnamese", "Indonesian", "Czech", "Swedish", "Danish", "Finnish", "Norwegian", "Hungarian", "Romanian", "Ukrainian", "Greek", "Hebrew"]
+        },
+        "scrapeReviews": {
+            "title": "Scrape Reviews",
+            "type": "boolean",
+            "description": "Extract individual reviews for each place (charged per review)",
+            "default": true,
+            "sectionCaption": "Data to Extract"
+        },
+        "reviewsLimit": {
+            "title": "Reviews Limit Per Place",
+            "type": "integer",
+            "description": "Maximum number of reviews to extract per place",
+            "default": 5,
+            "minimum": 0,
+            "maximum": 100
+        },
+        "scrapeOpeningHours": {
+            "title": "Scrape Opening Hours",
+            "type": "boolean",
+            "description": "Extract opening hours for each place",
+            "default": true
+        },
+        "minRating": {
+            "title": "Minimum Rating Filter",
+            "type": "number",
+            "description": "Only include places with this rating or higher (leave empty for all)",
+            "minimum": 0,
+            "maximum": 5,
+            "sectionCaption": "Filters"
+        },
+        "status": {
+            "title": "Business Status Filter",
+            "type": "string",
+            "description": "Filter by business status",
+            "editor": "select",
+            "enum": ["", "open", "closed_permanent", "closed_temporary"],
+            "enumTitles": ["All", "Open only", "Permanently closed", "Temporarily closed"]
+        },
+        "proxyConfig": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings for avoiding blocks. Apify Proxy recommended.",
+            "editor": "proxy",
+            "prefill": { "useApifyProxy": true },
+            "sectionCaption": "Proxy"
+        }
+    },
+    "required": []
+}

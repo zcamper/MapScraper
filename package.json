@@ -1,0 +1,47 @@
+{
+  "name": "google-maps-scraper",
+  "version": "2.0.0",
+  "description": "Google Maps scraper with CLI, REST API, Apify Actor, and Lead Gen SaaS",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "scrape": "node src/cli.js",
+    "test": "node --test tests/**/*.test.js",
+    "actor:start": "node .actor/main.js",
+    "actor:push": "apify push",
+    "api:start": "node api/server.js",
+    "api:dev": "node --watch api/server.js",
+    "webapp:start": "node webapp/server.js",
+    "webapp:dev": "node --watch webapp/server.js"
+  },
+  "keywords": [
+    "google maps",
+    "web scraping",
+    "data extraction",
+    "playwright",
+    "lead generation",
+    "api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "apify": "^3.1.0",
+    "axios": "^1.7.7",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.0.0",
+    "csv-stringify": "^6.6.0",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.0",
+    "jsdom": "^28.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "p-queue": "^8.1.0",
+    "playwright": "^1.50.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

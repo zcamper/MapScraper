@@ -1,0 +1,45 @@
+MIT License
+
+Copyright (c) 2024 Google Maps Scraper Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+DISCLAIMER FOR WEB SCRAPING:
+
+This software is provided for educational and lawful purposes only. Users of
+this software are responsible for:
+
+1. Compliance with Google's Terms of Service and Maps API policies
+2. Respect for the intellectual property rights of all data sources
+3. Adherence to local, state, and national laws regarding web scraping
+4. Responsible use of extracted data in accordance with privacy laws
+5. Not overloading or interfering with website availability
+
+Excessive, rapid, or automated requests to Google Maps may result in:
+- IP address blocking
+- Account suspension or permanent ban
+- Legal action from affected parties
+
+Always use appropriate delays between requests and consider proxy services
+for large-scale operations to avoid permanent blocking.
+
+The authors and contributors of this software assume no responsibility for 
+misuse, data breaches, or any damages resulting from improper usage.
