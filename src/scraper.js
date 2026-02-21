@@ -98,19 +98,32 @@ export class GoogleMapsScraper {
       validateSearchInput(searchTerm);
 
       const url = this.buildSearchUrl(searchTerm, location);
-      console.log(`\nSearching for: "${searchTerm}" in "${location}"\n`);
+      console.log(`\nSearching for: "${searchTerm}" in "${location}"`);
+      console.log(`  URL: ${url}\n`);
 
       await this.page.goto(url, { waitUntil: 'domcontentloaded' });
-      await delay(2000);
+      await delay(3000);
 
-      // Accept cookies/consent if prompted
+      // Accept cookies/consent if prompted (may redirect)
       await this.dismissConsentDialog();
 
+      // After consent, we may need to navigate to the search URL again
+      const postConsentUrl = this.page.url();
+      console.log(`  Post-consent URL: ${postConsentUrl}`);
+      if (!postConsentUrl.includes('/maps/search/') && !postConsentUrl.includes('/maps/place/')) {
+        console.log('  Re-navigating to search URL after consent...');
+        await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+        await delay(3000);
+        await this.dismissConsentDialog();
+      }
+
       // Wait for results to appear
+      console.log('  Waiting for place links...');
       await this.page.waitForSelector('a[href*="/maps/place/"]', {
         timeout: this.options.timeout,
       }).catch(() => {
-        console.warn('No place links found on page, results may be empty');
+        console.warn('  No place links found on page, results may be empty');
+        console.warn(`  Current URL: ${this.page.url()}`);
       });
 
       // Scroll and collect result links
@@ -150,15 +163,26 @@ export class GoogleMapsScraper {
       console.log(`\nScraping: ${mapUrl}\n`);
 
       await this.page.goto(mapUrl, { waitUntil: 'domcontentloaded' });
-      await delay(2000);
+      await delay(3000);
 
       await this.dismissConsentDialog();
 
+      // After consent, re-navigate if needed
+      const postConsentUrl = this.page.url();
+      if (!postConsentUrl.includes('/maps/search/') && !postConsentUrl.includes('/maps/place/')) {
+        console.log('  Re-navigating after consent...');
+        await this.page.goto(mapUrl, { waitUntil: 'domcontentloaded' });
+        await delay(3000);
+        await this.dismissConsentDialog();
+      }
+
       // Wait for results to appear
+      console.log('  Waiting for place links...');
       await this.page.waitForSelector('a[href*="/maps/place/"]', {
         timeout: this.options.timeout,
       }).catch(() => {
-        console.warn('No place links found on page, results may be empty');
+        console.warn('  No place links found on page, results may be empty');
+        console.warn(`  Current URL: ${this.page.url()}`);
       });
 
       const resultLinks = await this.scrollAndCollectResults(
@@ -192,17 +216,71 @@ export class GoogleMapsScraper {
   }
 
   /**
-   * Dismiss Google consent dialog if present
+   * Dismiss Google consent dialog if present.
+   * Handles both the overlay popup and the full-page consent.google.com redirect
+   * that appears in EU regions (including Apify's datacenters).
    */
   async dismissConsentDialog() {
     try {
-      const consentButton = this.page.locator('button:has-text("Accept all"), button:has-text("Reject all"), form[action*="consent"] button');
-      if (await consentButton.first().isVisible({ timeout: 2000 }).catch(() => false)) {
-        await consentButton.first().click();
-        await delay(500);
+      const currentUrl = this.page.url();
+
+      // Case 1: Full-page redirect to consent.google.com
+      if (currentUrl.includes('consent.google.com') || currentUrl.includes('consent.youtube.com')) {
+        console.log('  Consent redirect detected, accepting...');
+        // Try multiple button selectors used by Google's consent page
+        const selectors = [
+          'button[aria-label*="Accept" i]',
+          'button:has-text("Accept all")',
+          'button:has-text("Reject all")',
+          'button:has-text("I agree")',
+          'button:has-text("Agree")',
+          'button:has-text("Aceptar todo")',
+          'button:has-text("Tout accepter")',
+          'button:has-text("Alle akzeptieren")',
+          'form[action*="consent"] button:first-of-type',
+          'form[action*="consent"] input[type="submit"]',
+          '#L2AGLb',           // Common consent button ID
+          '[data-id="EGeslb"]', // Another consent variant
+        ];
+
+        for (const selector of selectors) {
+          const btn = this.page.locator(selector).first();
+          if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await btn.click();
+            console.log(`  Clicked consent button: ${selector}`);
+            await delay(2000);
+            break;
+          }
+        }
+
+        // Wait for redirect back to maps
+        await this.page.waitForURL('**/google.com/maps/**', { timeout: 10000 }).catch(() => {
+          console.warn('  Did not redirect back to Maps after consent');
+        });
+        await delay(1000);
+        return;
       }
-    } catch {
-      // No consent dialog, continue
+
+      // Case 2: Overlay consent dialog on top of Maps
+      const overlaySelectors = [
+        'button[aria-label*="Accept" i]',
+        'button:has-text("Accept all")',
+        'button:has-text("Reject all")',
+        '[role="dialog"] button:first-of-type',
+        '.VfPpkd-LgbsSe[data-mdc-dialog-action="accept"]',
+      ];
+
+      for (const selector of overlaySelectors) {
+        const btn = this.page.locator(selector).first();
+        if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await btn.click();
+          console.log(`  Dismissed consent overlay: ${selector}`);
+          await delay(500);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn(`  Consent dialog handling error: ${e.message}`);
     }
   }
 

@@ -10,8 +10,11 @@ import GoogleMapsScraper from '../src/scraper.js';
 
 await Actor.init();
 
+let scraper = null;
+
 try {
     const input = await Actor.getInput() ?? {};
+    Actor.log.info('Input received', { input: { ...input, proxyConfig: input.proxyConfig ? '(set)' : '(not set)' } });
 
     const {
         searchTerms = [],
@@ -44,9 +47,12 @@ try {
         const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
         const proxyUrl = await proxyConfiguration.newUrl();
         proxyList = [proxyUrl];
+        Actor.log.info('Using Apify Proxy');
+    } else {
+        Actor.log.info('No proxy configured - running without proxy');
     }
 
-    const scraper = new GoogleMapsScraper({
+    scraper = new GoogleMapsScraper({
         headless: true,
         maxResults,
         useProxy: proxyList.length > 0,
@@ -60,8 +66,17 @@ try {
 
     await scraper.initialize();
 
-    // Process results: push to dataset and charge per event
-    const processResults = async (results) => {
+    let totalResults = 0;
+
+    // Helper: process and push results to dataset
+    const processResults = async (results, label) => {
+        if (results.length === 0) {
+            Actor.log.warning(`No results returned for: ${label}`);
+            // Save debug screenshot to key-value store
+            await saveDebugScreenshot(scraper, `no-results-${label.replace(/[^a-z0-9]/gi, '_')}`);
+            return;
+        }
+
         for (const place of results) {
             await Actor.pushData(place);
             await Actor.charge({ eventName: 'place-scraped', count: 1 });
@@ -73,14 +88,15 @@ try {
                 });
             }
         }
-        Actor.log.info(`Pushed ${results.length} places to dataset`);
+        totalResults += results.length;
+        Actor.log.info(`Pushed ${results.length} places to dataset (total: ${totalResults})`);
     };
 
     // Process direct URLs
     for (const url of directUrls) {
         Actor.log.info(`Scraping URL: ${url}`);
         const results = await scraper.scrapeUrl(url, { maxResults, minRating, status });
-        await processResults(results);
+        await processResults(results, url);
     }
 
     // Process search terms
@@ -92,15 +108,36 @@ try {
             minRating,
             status,
         });
-        await processResults(results);
+        await processResults(results, `${term} in ${location}`);
     }
 
-    await scraper.close();
-    Actor.log.info('Scraping completed successfully');
+    Actor.log.info(`Scraping completed. Total results: ${totalResults}`);
 
 } catch (error) {
     Actor.log.error(`Actor failed: ${error.message}`);
+    // Try to save a screenshot for debugging
+    if (scraper?.page) {
+        await saveDebugScreenshot(scraper, 'error');
+    }
     throw error;
 } finally {
+    if (scraper) await scraper.close();
     await Actor.exit();
+}
+
+/**
+ * Save a screenshot and page URL to the Apify key-value store for debugging.
+ */
+async function saveDebugScreenshot(scraper, label) {
+    try {
+        if (!scraper.page) return;
+        const kvStore = await Actor.openKeyValueStore();
+        const screenshot = await scraper.page.screenshot({ fullPage: true });
+        await kvStore.setValue(`debug-screenshot-${label}`, screenshot, { contentType: 'image/png' });
+        const currentUrl = scraper.page.url();
+        const pageTitle = await scraper.page.title().catch(() => 'unknown');
+        Actor.log.info(`Debug screenshot saved as "debug-screenshot-${label}"`, { currentUrl, pageTitle });
+    } catch (e) {
+        Actor.log.warning(`Could not save debug screenshot: ${e.message}`);
+    }
 }
