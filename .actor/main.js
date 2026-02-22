@@ -310,16 +310,13 @@ try {
                 if (!data.placeName) continue;
 
                 // Extract reviews if requested AND we have time budget
-                if (scrapeReviews && reviewsLimit > 0 && timeOk(60_000)) {
+                // Only do reviews if avg time per place allows it
+                const canDoReviews = scrapeReviews && reviewsLimit > 0 && timeOk(45_000);
+                if (canDoReviews) {
                     try {
                         data.reviews = await extractReviews(page, reviewsLimit);
                     } catch (e) {
                         data.reviews = [];
-                    }
-                } else if (scrapeReviews && !timeOk(60_000)) {
-                    // Log once when we start skipping reviews
-                    if (j === 0 || timeOk(59_000)) {
-                        log(`  Skipping reviews — time budget low (${remaining()}ms left)`);
                     }
                 }
 
@@ -495,7 +492,7 @@ async function scrollAndCollect(page, maxResults) {
     });
     log(`Scroll container: ${containerInfo ? `${containerInfo.selector} (${containerInfo.scrollHeight}h / ${containerInfo.clientHeight}ch)` : 'not found'}`);
 
-    while (placeLinks.size < maxResults && scrollAttempts < 80 && timeOk(60_000)) {
+    while (placeLinks.size < maxResults && scrollAttempts < 100 && timeOk(60_000)) {
         // Collect all visible place links
         const links = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('a[href*="/maps/place/"]'))
@@ -521,7 +518,7 @@ async function scrollAndCollect(page, maxResults) {
             if (endEl) {
                 const text = endEl.textContent || '';
                 if (text.includes("You've reached the end") || text.includes("end of list")) {
-                    return 'end-element: ' + text.substring(0, 80);
+                    return 'end-element';
                 }
             }
             const feed = document.querySelector('[role="feed"]');
@@ -539,36 +536,106 @@ async function scrollAndCollect(page, maxResults) {
             break;
         }
 
-        if (staleRounds >= 8) {
-            log(`No new links after ${staleRounds} scrolls, stopping at ${placeLinks.size}`);
-            await saveScreenshot(page, `scroll-stale-${placeLinks.size}`).catch(() => {});
-            break;
-        }
+        // When stale, try progressively more aggressive tactics
+        if (staleRounds >= 3) {
+            if (staleRounds === 3) {
+                log(`  Scroll stalling at ${placeLinks.size}, trying recovery tactics...`);
+            }
 
-        // Scroll
-        await page.evaluate(() => {
-            const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '[role="main"] [tabindex="-1"]', '.m6QErb'];
-            for (const sel of selectors) {
-                const c = document.querySelector(sel);
-                if (c && c.scrollHeight > c.clientHeight) {
-                    c.scrollBy(0, 2000);
-                    return;
+            // Tactic 1: Scroll the last visible result into view to trigger lazy loading
+            if (staleRounds === 3 || staleRounds === 6) {
+                await page.evaluate(() => {
+                    const links = document.querySelectorAll('a[href*="/maps/place/"]');
+                    if (links.length > 0) {
+                        links[links.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
+                    }
+                });
+                await sleep(2000);
+            }
+
+            // Tactic 2: Click on the feed to ensure focus, then use keyboard
+            if (staleRounds === 4 || staleRounds === 7) {
+                await page.evaluate(() => {
+                    const feed = document.querySelector('[role="feed"]');
+                    if (feed) feed.click();
+                });
+                await sleep(300);
+                for (let k = 0; k < 5; k++) {
+                    await page.keyboard.press('ArrowDown').catch(() => {});
+                    await sleep(100);
+                }
+                await page.keyboard.press('End').catch(() => {});
+                await sleep(2000);
+            }
+
+            // Tactic 3: Look for "Show more results" or similar buttons
+            if (staleRounds === 5 || staleRounds === 8) {
+                const clicked = await page.evaluate(() => {
+                    const btns = document.querySelectorAll('button, [role="button"]');
+                    for (const btn of btns) {
+                        const text = (btn.textContent || '').toLowerCase();
+                        if (text.includes('more results') || text.includes('show more') || text.includes('next page')) {
+                            btn.click();
+                            return text.trim().substring(0, 50);
+                        }
+                    }
+                    return '';
+                });
+                if (clicked) {
+                    log(`  Clicked "${clicked}" button`);
+                    await sleep(3000);
                 }
             }
-            const main = document.querySelector('[role="main"]');
-            if (main) {
-                for (const d of main.querySelectorAll('div')) {
-                    if (d.scrollHeight > d.clientHeight + 100) { d.scrollBy(0, 2000); return; }
-                }
-            }
-        });
 
-        if (scrollAttempts % 2 === 0) {
-            await page.keyboard.press('End').catch(() => {});
+            // Tactic 4: Scroll the container to its absolute maximum
+            if (staleRounds === 6 || staleRounds === 9) {
+                await page.evaluate(() => {
+                    const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '.m6QErb'];
+                    for (const sel of selectors) {
+                        const c = document.querySelector(sel);
+                        if (c && c.scrollHeight > c.clientHeight) {
+                            c.scrollTop = c.scrollHeight;
+                            return;
+                        }
+                    }
+                });
+                await sleep(2500);
+            }
+
+            // Give up after 10 stale rounds (was 8)
+            if (staleRounds >= 10) {
+                log(`No new links after ${staleRounds} recovery attempts, stopping at ${placeLinks.size}`);
+                await saveScreenshot(page, `scroll-stale-${placeLinks.size}`).catch(() => {});
+                break;
+            }
+        } else {
+            // Normal scroll
+            await page.evaluate(() => {
+                const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '[role="main"] [tabindex="-1"]', '.m6QErb'];
+                for (const sel of selectors) {
+                    const c = document.querySelector(sel);
+                    if (c && c.scrollHeight > c.clientHeight) {
+                        c.scrollBy(0, 2000);
+                        return;
+                    }
+                }
+                const main = document.querySelector('[role="main"]');
+                if (main) {
+                    for (const d of main.querySelectorAll('div')) {
+                        if (d.scrollHeight > d.clientHeight + 100) { d.scrollBy(0, 2000); return; }
+                    }
+                }
+            });
+
+            if (scrollAttempts % 2 === 0) {
+                await page.keyboard.press('End').catch(() => {});
+            }
         }
 
         scrollAttempts++;
-        await sleep(scrollAttempts % 5 === 0 ? 2500 : 1500);
+        // Wait longer during stale recovery
+        const waitMs = staleRounds >= 3 ? 3000 : (scrollAttempts % 5 === 0 ? 2500 : 1500);
+        await sleep(waitMs);
 
         if (scrollAttempts % 5 === 0) {
             log(`  Scroll: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})`);
@@ -584,6 +651,7 @@ async function scrollAndCollect(page, maxResults) {
  * Clicks Reviews tab, scrolls briefly, extracts.
  */
 async function extractReviews(page, limit) {
+    // Click the Reviews tab
     const tabClicked = await page.evaluate(() => {
         const tabs = document.querySelectorAll('button[role="tab"]');
         for (const tab of tabs) {
@@ -594,29 +662,23 @@ async function extractReviews(page, limit) {
     });
     if (!tabClicked) return [];
 
-    // Short wait for reviews to appear
-    await sleep(1500);
-    await page.waitForSelector('div[data-review-id], div.jftiEf', { timeout: 3000 }).catch(() => {});
+    // Wait just enough for reviews to load (most show 3 immediately)
+    await page.waitForSelector('div[data-review-id], div.jftiEf', { timeout: 2500 }).catch(() => {});
 
-    // Brief scroll to load a few more (max 3 rounds)
-    for (let s = 0; s < Math.min(Math.ceil(limit / 3), 3); s++) {
-        const count = await page.$$eval('div[data-review-id], div.jftiEf', els => els.length).catch(() => 0);
-        if (count >= limit) break;
+    // One quick scroll if we need more than 3
+    if (limit > 3) {
         await page.evaluate(() => {
             const c = document.querySelector('.m6QErb.DxyBCb.kA9KIf') || document.querySelector('.m6QErb.DxyBCb');
-            if (c) c.scrollBy(0, 800);
+            if (c) c.scrollBy(0, 1500);
         });
-        await sleep(800);
+        await sleep(600);
     }
 
-    // Expand truncated reviews
-    await page.$$eval('button[aria-label="See more"], button.w8nwRe', btns => {
-        btns.slice(0, 10).forEach(b => b.click());
-    }).catch(() => {});
-    await sleep(300);
-
-    // Extract
+    // Expand + extract in one call
     const reviews = await page.evaluate((lim) => {
+        // Click "See more" buttons
+        document.querySelectorAll('button[aria-label="See more"], button.w8nwRe').forEach(b => b.click());
+
         const reviewEls = document.querySelectorAll('div[data-review-id], div.jftiEf');
         const results = [];
         for (let i = 0; i < Math.min(reviewEls.length, lim); i++) {
