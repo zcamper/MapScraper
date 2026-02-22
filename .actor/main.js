@@ -40,7 +40,7 @@ log('Actor.init() completed');
 
 // Track whether we succeeded to control exit code
 let actorFailed = false;
-let chromium, JSDOM;
+let chromium;
 
 try {
     log('Calling Actor.getInput()...');
@@ -102,10 +102,7 @@ try {
     chromium = pw.chromium;
     log('Playwright imported');
 
-    log('Importing JSDOM...');
-    const jsdomModule = await import('jsdom');
-    JSDOM = jsdomModule.JSDOM;
-    log('JSDOM imported');
+    // JSDOM no longer needed — extracting directly from live browser DOM
 
     // Parse Apify proxy URL for Playwright format
     function parseProxyUrl(url) {
@@ -134,8 +131,8 @@ try {
         p.setDefaultTimeout(90000);
         p.setDefaultNavigationTimeout(90000);
         log(`[${label}] Browser ready, navigating to Google Maps...`);
-        // Use 30s timeout for the connectivity test (not full 90s)
-        await p.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // Use 15s timeout for the connectivity test
+        await p.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
         await sleep(3000);
         log(`[${label}] Landed on: ${p.url()} (title: "${await p.title()}")`);
         return { browser: b, context: ctx, page: p };
@@ -206,12 +203,10 @@ try {
         await saveScreenshot(page, 'step-2b-re-navigate');
     }
 
-    // --- Import data extraction modules ---
-    log('Importing DataExtractor...');
-    const { DataExtractor } = await import('../src/dataExtractor.js');
+    // --- Import utility modules ---
     log('Importing utils...');
     const { filterByRating, filterByStatus } = await import('../src/utils.js');
-    log('All modules imported');
+    log('Utils imported');
 
     let totalResults = 0;
 
@@ -268,59 +263,78 @@ try {
             continue;
         }
 
-        // Visit each place and extract details
+        // Visit each place and extract ALL data via page.evaluate (no JSDOM)
         let results = [];
-        // Collect websites for batch email enrichment after extraction
-        const emailQueue = []; // { index, website }
+        const emailQueue = [];
 
         for (let j = 0; j < placeLinks.length; j++) {
             try {
-                await page.goto(placeLinks[j], { waitUntil: 'domcontentloaded' });
+                await page.goto(placeLinks[j], { waitUntil: 'commit' });
+                // Wait for the place name heading to appear
+                await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
 
-                // Wait for heading (reduced timeout)
-                await page.waitForSelector('h1, [role="main"] h1', { timeout: 5000 }).catch(() => {});
+                // Extract everything from the live DOM in one evaluate call
+                const data = await page.evaluate(() => {
+                    const r = {};
+                    // Name
+                    const h1 = document.querySelector('h1');
+                    r.placeName = h1?.textContent?.trim() || '';
+                    // Rating
+                    const ratingEl = document.querySelector('[role="img"][aria-label*="star" i]');
+                    if (ratingEl) {
+                        const m = (ratingEl.getAttribute('aria-label') || '').match(/([\d.]+)/);
+                        if (m) r.totalReviewScore = parseFloat(m[1]);
+                    }
+                    // Review count
+                    const reviewEls = document.querySelectorAll('[aria-label*="review" i]');
+                    for (const el of reviewEls) {
+                        const m = (el.getAttribute('aria-label') || '').match(/([\d,]+)\s*review/i);
+                        if (m) { r.reviewCount = parseInt(m[1].replace(/,/g, '')); break; }
+                    }
+                    // Category
+                    const catBtn = document.querySelector('button[jsaction*="category"]');
+                    r.category = catBtn?.textContent?.trim() || '';
+                    // Phone
+                    const phoneEl = document.querySelector('[data-item-id*="phone"] .Io6YTe, [data-item-id*="phone"] .rogA2c');
+                    r.phoneNumber = phoneEl?.textContent?.trim() || '';
+                    // Website
+                    const webEl = document.querySelector('[data-item-id="authority"] a');
+                    r.website = webEl?.getAttribute('href') || '';
+                    // Address
+                    const addrEl = document.querySelector('[data-item-id="address"] .Io6YTe, [data-item-id="address"] .rogA2c');
+                    r.address = { fullAddress: addrEl?.textContent?.trim() || '' };
+                    // Email (rare on Maps)
+                    const emailEl = document.querySelector('[data-item-id*="email"] .Io6YTe, [data-item-id*="email"] .rogA2c');
+                    r.email = emailEl?.textContent?.trim() || '';
+                    const mailto = document.querySelector('a[href^="mailto:"]');
+                    if (mailto && !r.email) r.email = mailto.href.replace('mailto:', '').split('?')[0];
+                    // Status
+                    const bodyText = document.body?.innerText || '';
+                    r.permanentlyClosed = bodyText.includes('Permanently closed');
+                    r.temporarilyClosed = bodyText.includes('Temporarily closed');
+                    return r;
+                });
 
-                const html = await page.content();
-                const dom = new JSDOM(html);
-                const mainContent = dom.window.document.querySelector('[role="main"]') || dom.window.document.body;
+                if (!data.placeName) continue;
 
-                const placeData = DataExtractor.extractPlaceData(mainContent, 'https://www.google.com/maps');
-                if (!placeData || !placeData.placeName) continue;
-
-                placeData.url = placeLinks[j];
-
-                // Extract coordinates from URL
+                // Coordinates from URL
                 const coordMatch = page.url().match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) ||
                                    page.url().match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
                 if (coordMatch) {
-                    placeData.coordinates = {
+                    data.coordinates = {
                         latitude: parseFloat(coordMatch[1]),
                         longitude: parseFloat(coordMatch[2]),
                     };
                 }
+                data.url = placeLinks[j];
+                data.emails = data.email ? [data.email] : [];
+                delete data.email;
+                data.scrapedAt = new Date().toISOString();
 
-                // Extract live data from Playwright DOM
-                const liveData = await extractLiveData(page);
-                if (liveData.rating && !placeData.totalReviewScore) placeData.totalReviewScore = liveData.rating;
-                if (liveData.reviewCount && !placeData.reviewCount) placeData.reviewCount = liveData.reviewCount;
-                if (liveData.category && !placeData.category) placeData.category = liveData.category;
-                if (liveData.phone && !placeData.phoneNumber) placeData.phoneNumber = liveData.phone;
-                if (liveData.website && !placeData.website) placeData.website = liveData.website;
-                if (liveData.address && !placeData.address?.fullAddress) {
-                    placeData.address = { ...placeData.address, fullAddress: liveData.address };
-                }
-                // Grab email from Maps page if available
-                if (liveData.email) {
-                    placeData.emails = [liveData.email];
-                }
-                if (!placeData.emails) placeData.emails = [];
+                results.push(data);
 
-                const normalized = DataExtractor.normalizeData(placeData);
-                results.push(normalized);
-
-                // Queue website for email enrichment (done after all places)
-                if (scrapeEmails && normalized.website && normalized.emails.length === 0) {
-                    emailQueue.push({ index: results.length - 1, website: normalized.website });
+                if (scrapeEmails && data.website && data.emails.length === 0) {
+                    emailQueue.push({ index: results.length - 1, website: data.website });
                 }
 
                 if ((j + 1) % 10 === 0) {
@@ -502,11 +516,21 @@ async function scrollAndCollect(page, maxResults) {
         }
         previousCount = placeLinks.size;
 
-        // Check for "end of results" indicator
+        // Check for "end of results" indicator — must be in the results panel, not whole page
         const endReached = await page.evaluate(() => {
-            const body = document.body?.innerText || '';
-            return body.includes("You've reached the end") ||
-                   body.includes("No more results");
+            // Look for the specific end-of-list element Google Maps uses
+            const endEl = document.querySelector('.HlvSq, .PbZDve, .lXJj5c');
+            if (endEl) {
+                const text = endEl.textContent || '';
+                return text.includes("You've reached the end") || text.includes("end of list");
+            }
+            // Also check the last child of the results feed
+            const feed = document.querySelector('[role="feed"]');
+            if (feed && feed.lastElementChild) {
+                const text = feed.lastElementChild.textContent || '';
+                return text.includes("You've reached the end");
+            }
+            return false;
         });
 
         if (endReached) {
