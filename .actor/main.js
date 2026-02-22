@@ -138,21 +138,45 @@ try {
         }
 
         const term = searchTerms[i];
-        log(`[${i + 1}/${searchTerms.length}] Searching: "${term}" in "${location}"`);
+        const fullQuery = `${term} in ${location}`;
+        log(`[${i + 1}/${searchTerms.length}] Searching: "${fullQuery}"`);
 
-        const searchQuery = encodeURIComponent(`${term} in ${location}`);
-        const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
-        log(`Search URL: ${searchUrl}`);
+        // Use the search box like a real user — direct URL navigation often
+        // triggers Google's bot detection and returns very few results
+        const searchInput = page.locator('#searchboxinput');
+        const searchBoxVisible = await searchInput.isVisible({ timeout: 3000 }).catch(() => false);
 
-        await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-        await sleep(3000);
+        if (searchBoxVisible) {
+            log('Using search box method...');
+            await searchInput.click();
+            await searchInput.fill('');
+            await sleep(200);
+            await searchInput.fill(fullQuery);
+            await sleep(300);
+            await page.keyboard.press('Enter');
+            await sleep(4000);
+        } else {
+            // Fallback to URL-based search
+            log('Search box not found, using URL method...');
+            const searchQuery = encodeURIComponent(fullQuery);
+            const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+            await sleep(3000);
+        }
 
         // Handle consent if needed
         if (page.url().includes('consent.google')) {
             await handleConsent(page);
             await sleep(1500);
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(3000);
+            // Re-navigate to Maps and try again
+            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+            await sleep(2000);
+            const retryInput = page.locator('#searchboxinput');
+            if (await retryInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await retryInput.fill(fullQuery);
+                await page.keyboard.press('Enter');
+                await sleep(4000);
+            }
         }
 
         log(`Search page URL: ${page.url()}`);
@@ -160,7 +184,7 @@ try {
 
         // Wait for results
         log('Waiting for place links...');
-        const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
+        let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
             .then(() => true)
             .catch(() => false);
 
@@ -177,8 +201,29 @@ try {
         log('Place links found! Collecting results...');
 
         // Scroll and collect place links
-        const placeLinks = await scrollAndCollect(page, maxResults);
+        let placeLinks = await scrollAndCollect(page, maxResults);
         log(`Collected ${placeLinks.length} place links`);
+
+        // If we got very few results, retry with URL method as fallback
+        if (placeLinks.length < 10 && timeOk(120_000)) {
+            log(`Only ${placeLinks.length} results — retrying with URL-based search...`);
+            const searchQuery = encodeURIComponent(fullQuery);
+            const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+            await sleep(4000);
+            await saveScreenshot(page, `step-3b-retry-${i}`);
+
+            hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
+                .then(() => true).catch(() => false);
+            if (hasResults) {
+                const retryLinks = await scrollAndCollect(page, maxResults);
+                log(`URL retry collected ${retryLinks.length} place links`);
+                if (retryLinks.length > placeLinks.length) {
+                    placeLinks = retryLinks;
+                    log(`Using URL method results (${placeLinks.length} > previous ${placeLinks.length})`);
+                }
+            }
+        }
 
         if (placeLinks.length === 0) {
             await saveScreenshot(page, `step-5-no-links-${i}`);
@@ -401,6 +446,12 @@ try {
 
         log(`Extracted ${results.length} places for "${term}"`);
         totalResults += results.length;
+
+        // Navigate back to Maps for the next search term
+        if (i < searchTerms.length - 1 && timeOk(30_000)) {
+            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+            await sleep(1500);
+        }
     }
 
     // --- Process direct URLs ---
