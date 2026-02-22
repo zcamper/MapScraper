@@ -9,32 +9,44 @@
  * need special handling.
  */
 
-console.log('[ACTOR] Script starting...');
+// Synchronous flush helper - ensures log output is visible before process dies
+function log(msg) {
+    const line = `[ACTOR] ${msg}\n`;
+    process.stdout.write(line);
+}
+function logErr(msg) {
+    const line = `[ACTOR ERROR] ${msg}\n`;
+    process.stderr.write(line);
+}
+
+log('Script starting...');
 
 // Catch any unhandled errors at process level
 process.on('unhandledRejection', (reason) => {
-    console.error('[ACTOR] Unhandled rejection:', reason);
+    logErr(`Unhandled rejection: ${reason}`);
+    if (reason?.stack) logErr(reason.stack);
 });
 process.on('uncaughtException', (err) => {
-    console.error('[ACTOR] Uncaught exception:', err);
+    logErr(`Uncaught exception: ${err.message}`);
+    logErr(err.stack);
     process.exit(1);
 });
 
 import { Actor } from 'apify';
 
-console.log('[ACTOR] Calling Actor.init()...');
+log('Calling Actor.init()...');
 await Actor.init();
-console.log('[ACTOR] Actor.init() completed');
+log('Actor.init() completed');
 
-// Lazy-load heavy deps
+// Track whether we succeeded to control exit code
+let actorFailed = false;
 let chromium, JSDOM;
 
 try {
-    console.log('[ACTOR] Calling Actor.getInput()...');
+    log('Calling Actor.getInput()...');
     const input = await Actor.getInput() ?? {};
-    console.log('[ACTOR] Got input, searchTerms:', input.searchTerms);
-    console.log('[ACTOR] Full input keys:', Object.keys(input));
-    console.log('[ACTOR] location:', input.location, 'maxResults:', input.maxResults);
+    log(`Got input. Keys: ${Object.keys(input).join(', ')}`);
+    log(`searchTerms: ${JSON.stringify(input.searchTerms)}, location: ${input.location}, maxResults: ${input.maxResults}`);
 
     const {
         searchTerms = [],
@@ -50,7 +62,7 @@ try {
         proxyConfig,
     } = input;
 
-    console.log('[ACTOR] Destructured OK. searchTerms:', searchTerms.length, 'location:', location, 'directUrls:', directUrls.length);
+    log(`Destructured OK. searchTerms=${searchTerms.length}, location="${location}", directUrls=${directUrls.length}`);
 
     // Validate
     if (searchTerms.length === 0 && directUrls.length === 0) {
@@ -59,32 +71,40 @@ try {
     if (searchTerms.length > 0 && !location) {
         throw new Error('location is required when using searchTerms.');
     }
+    log('Validation passed');
 
-    console.log('[ACTOR] Validation passed');
-    console.log('[ACTOR] Charging actor-start event...');
-    await Actor.charge({ eventName: 'actor-start', count: 1 }).catch(e => {
-        console.log('[ACTOR] charge() warning (expected if not configured):', e.message);
-    });
+    // Charge for actor start (non-fatal if not configured)
+    log('Charging actor-start event...');
+    try {
+        await Actor.charge({ eventName: 'actor-start', count: 1 });
+        log('actor-start charge succeeded');
+    } catch (e) {
+        log(`actor-start charge skipped (expected if not configured): ${e.message}`);
+    }
 
     // --- Set up proxy ---
+    log('Setting up proxy...');
     let proxyUrl = null;
     if (proxyConfig?.useApifyProxy) {
+        log('Creating Apify proxy configuration...');
         const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
         proxyUrl = await proxyConfiguration.newUrl();
-        // Log redacted URL for debugging
         const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
-        Actor.log.info(`Apify Proxy URL: ${redacted}`);
+        log(`Proxy URL: ${redacted}`);
+    } else {
+        log('No proxy configured');
     }
 
     // --- Launch browser directly (bypass ProxyManager for Apify) ---
-    console.log('[ACTOR] Loading Playwright...');
-    Actor.log.info('Loading Playwright...');
+    log('Importing Playwright...');
     const pw = await import('playwright');
     chromium = pw.chromium;
-    console.log('[ACTOR] Playwright loaded, loading JSDOM...');
+    log('Playwright imported');
+
+    log('Importing JSDOM...');
     const jsdomModule = await import('jsdom');
     JSDOM = jsdomModule.JSDOM;
-    console.log('[ACTOR] JSDOM loaded');
+    log('JSDOM imported');
 
     // Parse Apify proxy URL for Playwright format
     let playwrightProxy = undefined;
@@ -96,9 +116,9 @@ try {
                 username: decodeURIComponent(parsed.username),
                 password: decodeURIComponent(parsed.password),
             };
-            Actor.log.info(`Proxy server: ${playwrightProxy.server}, user: ${playwrightProxy.username.substring(0, 10)}...`);
+            log(`Proxy parsed: server=${playwrightProxy.server}, user=${playwrightProxy.username.substring(0, 10)}...`);
         } catch (e) {
-            Actor.log.error(`Failed to parse proxy URL: ${e.message}`);
+            logErr(`Failed to parse proxy URL: ${e.message}`);
         }
     }
 
@@ -108,8 +128,10 @@ try {
         launchOptions.proxy = playwrightProxy;
     }
 
-    Actor.log.info('Launching browser...');
+    log('Launching browser...');
     const browser = await chromium.launch(launchOptions);
+    log('Browser process launched');
+
     const context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         locale: language,
@@ -117,97 +139,96 @@ try {
     const page = await context.newPage();
     page.setDefaultTimeout(90000);
     page.setDefaultNavigationTimeout(90000);
-    Actor.log.info('Browser launched');
+    log('Browser page ready');
 
     // --- Test connectivity ---
-    Actor.log.info('Testing Google Maps connectivity...');
+    log('Navigating to Google Maps...');
     await page.goto('https://www.google.com/maps/?hl=' + language, { waitUntil: 'domcontentloaded' });
     await sleep(3000);
 
     let currentUrl = page.url();
     let pageTitle = await page.title();
-    Actor.log.info(`Landed on: ${currentUrl} (title: "${pageTitle}")`);
+    log(`Landed on: ${currentUrl} (title: "${pageTitle}")`);
     await saveScreenshot(page, 'step-1-initial-load');
 
     // --- Handle consent ---
     if (currentUrl.includes('consent.google') || currentUrl.includes('consent.youtube')) {
-        Actor.log.info('Consent page detected, handling...');
+        log('Consent page detected, handling...');
         await handleConsent(page);
         await sleep(2000);
         currentUrl = page.url();
         pageTitle = await page.title();
-        Actor.log.info(`After consent: ${currentUrl} (title: "${pageTitle}")`);
+        log(`After consent: ${currentUrl} (title: "${pageTitle}")`);
         await saveScreenshot(page, 'step-2-after-consent');
     }
 
     // Verify we're on Maps
     if (!currentUrl.includes('google.com/maps')) {
-        Actor.log.warning('Not on Google Maps after consent, re-navigating...');
+        log('Not on Google Maps after consent, re-navigating...');
         await page.goto('https://www.google.com/maps/?hl=' + language, { waitUntil: 'domcontentloaded' });
         await sleep(3000);
         await handleConsent(page);
         await sleep(2000);
-        Actor.log.info(`Re-nav URL: ${page.url()}`);
+        log(`Re-nav URL: ${page.url()}`);
         await saveScreenshot(page, 'step-2b-re-navigate');
     }
 
-    // --- Now import and use the scraper with the existing page ---
-    // We'll do scraping directly here since we've already set up the browser
+    // --- Import data extraction modules ---
+    log('Importing DataExtractor...');
     const { DataExtractor } = await import('../src/dataExtractor.js');
-    const {
-        delay,
-        filterByRating,
-        filterByStatus,
-    } = await import('../src/utils.js');
+    log('Importing utils...');
+    const { filterByRating, filterByStatus } = await import('../src/utils.js');
+    log('All modules imported');
 
     let totalResults = 0;
 
     // --- Process search terms ---
     for (let i = 0; i < searchTerms.length; i++) {
         const term = searchTerms[i];
-        Actor.log.info(`[${i + 1}/${searchTerms.length}] Searching: "${term}" in "${location}"`);
+        log(`[${i + 1}/${searchTerms.length}] Searching: "${term}" in "${location}"`);
 
         const searchQuery = encodeURIComponent(`${term} in ${location}`);
         const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
-        Actor.log.info(`Search URL: ${searchUrl}`);
+        log(`Search URL: ${searchUrl}`);
 
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
         await sleep(4000);
 
         // Handle consent again if needed
         if (page.url().includes('consent.google')) {
+            log('Consent page hit during search, handling...');
             await handleConsent(page);
             await sleep(2000);
-            // Re-navigate to search
             await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
             await sleep(4000);
         }
 
-        Actor.log.info(`Search page URL: ${page.url()}`);
+        log(`Search page URL: ${page.url()}`);
         await saveScreenshot(page, `step-3-search-${i}`);
 
         // Wait for results
+        log('Waiting for place links...');
         const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 30000 })
             .then(() => true)
             .catch(() => false);
 
         if (!hasResults) {
-            Actor.log.warning('No place links found on search results page');
-            Actor.log.info(`Page title: ${await page.title()}`);
-            // Try to get page text to understand what's showing
+            log('WARNING: No place links found on search results page');
+            const title = await page.title();
+            log(`Page title: ${title}`);
             const bodyText = await page.evaluate(() =>
                 document.body?.innerText?.substring(0, 500) || 'empty'
             );
-            Actor.log.info(`Page text preview: ${bodyText.substring(0, 300)}`);
+            log(`Page text preview: ${bodyText.substring(0, 300)}`);
             await saveScreenshot(page, `step-4-no-results-${i}`);
             continue;
         }
 
-        Actor.log.info('Place links found! Collecting results...');
+        log('Place links found! Collecting results...');
 
         // Scroll and collect place links
-        const placeLinks = await scrollAndCollect(page, maxResults, Actor.log);
-        Actor.log.info(`Collected ${placeLinks.length} place links`);
+        const placeLinks = await scrollAndCollect(page, maxResults);
+        log(`Collected ${placeLinks.length} place links`);
 
         if (placeLinks.length === 0) {
             await saveScreenshot(page, `step-5-no-links-${i}`);
@@ -258,12 +279,12 @@ try {
                 results.push(normalized);
 
                 if ((j + 1) % 5 === 0) {
-                    Actor.log.info(`  Extracted ${j + 1}/${placeLinks.length} places`);
+                    log(`  Extracted ${j + 1}/${placeLinks.length} places`);
                 }
 
                 await sleep(300 + Math.random() * 400);
             } catch (e) {
-                Actor.log.warning(`Failed to extract place ${j + 1}: ${e.message}`);
+                log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
             }
         }
 
@@ -271,14 +292,18 @@ try {
         if (minRating) results = filterByRating(results, minRating);
         if (status) results = filterByStatus(results, status);
 
-        Actor.log.info(`Extracted ${results.length} places for "${term}"`);
+        log(`Extracted ${results.length} places for "${term}"`);
 
         // Push to dataset
         for (const place of results) {
             await Actor.pushData(place);
-            await Actor.charge({ eventName: 'place-scraped', count: 1 });
+            try {
+                await Actor.charge({ eventName: 'place-scraped', count: 1 });
+            } catch {}
             if (place.reviews?.length > 0) {
-                await Actor.charge({ eventName: 'review-scraped', count: place.reviews.length });
+                try {
+                    await Actor.charge({ eventName: 'review-scraped', count: place.reviews.length });
+                } catch {}
             }
         }
         totalResults += results.length;
@@ -286,7 +311,7 @@ try {
 
     // --- Process direct URLs ---
     for (const directUrl of directUrls) {
-        Actor.log.info(`Scraping direct URL: ${directUrl}`);
+        log(`Scraping direct URL: ${directUrl}`);
         await page.goto(directUrl, { waitUntil: 'domcontentloaded' });
         await sleep(4000);
         if (page.url().includes('consent.google')) {
@@ -299,27 +324,32 @@ try {
         const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 30000 })
             .then(() => true).catch(() => false);
         if (!hasResults) {
-            Actor.log.warning(`No results for URL: ${directUrl}`);
+            log(`WARNING: No results for direct URL: ${directUrl}`);
             await saveScreenshot(page, 'direct-url-no-results');
             continue;
         }
 
-        const placeLinks = await scrollAndCollect(page, maxResults, Actor.log);
-        Actor.log.info(`Collected ${placeLinks.length} links from URL`);
-        // (same extraction loop as above - kept brief for direct URLs)
+        const placeLinks = await scrollAndCollect(page, maxResults);
+        log(`Collected ${placeLinks.length} links from direct URL`);
     }
 
     await browser.close();
-    Actor.log.info(`Scraping completed. Total results: ${totalResults}`);
+    log(`Scraping completed successfully. Total results: ${totalResults}`);
 
 } catch (error) {
-    console.error('[ACTOR] CAUGHT ERROR:', error.message);
-    console.error('[ACTOR] Stack:', error.stack);
+    actorFailed = true;
+    logErr(`CAUGHT ERROR: ${error.message}`);
+    logErr(`Stack: ${error.stack}`);
     try { Actor.log.error(`Actor failed: ${error.message}`); } catch {}
-    throw error;
 } finally {
-    console.log('[ACTOR] In finally block, calling Actor.exit()...');
-    await Actor.exit();
+    log(`In finally block. actorFailed=${actorFailed}`);
+    if (actorFailed) {
+        log('Calling Actor.fail()...');
+        await Actor.fail('Actor encountered an error — check logs above');
+    } else {
+        log('Calling Actor.exit()...');
+        await Actor.exit();
+    }
 }
 
 // --- Helper functions ---
@@ -348,7 +378,7 @@ async function handleConsent(page) {
             const btn = page.locator(selector).first();
             if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
                 await btn.click();
-                Actor.log.info(`Clicked consent: ${selector}`);
+                log(`Clicked consent: ${selector}`);
                 await sleep(2000);
                 return true;
             }
@@ -358,27 +388,27 @@ async function handleConsent(page) {
     // Last resort: try clicking any visible button on the page
     const allButtons = page.locator('button');
     const count = await allButtons.count();
-    Actor.log.info(`Consent page has ${count} buttons, trying first visible one...`);
+    log(`Consent page has ${count} buttons, trying first visible one...`);
     for (let i = 0; i < Math.min(count, 5); i++) {
         const btn = allButtons.nth(i);
         const text = await btn.textContent().catch(() => '');
         const visible = await btn.isVisible().catch(() => false);
-        Actor.log.info(`  Button ${i}: "${text?.trim()}" visible=${visible}`);
+        log(`  Button ${i}: "${text?.trim()}" visible=${visible}`);
         if (visible && text?.trim()) {
             await btn.click().catch(() => {});
             await sleep(2000);
             if (!page.url().includes('consent.google')) {
-                Actor.log.info(`  Consent resolved by clicking button ${i}`);
+                log(`  Consent resolved by clicking button ${i}`);
                 return true;
             }
         }
     }
 
-    Actor.log.warning('Could not find consent button');
+    log('WARNING: Could not find consent button');
     return false;
 }
 
-async function scrollAndCollect(page, maxResults, log) {
+async function scrollAndCollect(page, maxResults) {
     const placeLinks = new Set();
     let scrollAttempts = 0;
     let previousHeight = 0;
@@ -448,8 +478,8 @@ async function saveScreenshot(page, label) {
         const kvStore = await Actor.openKeyValueStore();
         const screenshot = await page.screenshot({ fullPage: true });
         await kvStore.setValue(`debug-${label}`, screenshot, { contentType: 'image/png' });
-        Actor.log.info(`Screenshot saved: debug-${label} (URL: ${page.url()})`);
+        log(`Screenshot saved: debug-${label}`);
     } catch (e) {
-        Actor.log.warning(`Screenshot failed: ${e.message}`);
+        log(`Screenshot failed: ${e.message}`);
     }
 }
