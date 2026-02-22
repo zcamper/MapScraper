@@ -465,9 +465,13 @@ async function handleConsent(page) {
 async function scrollAndCollect(page, maxResults) {
     const placeLinks = new Set();
     let scrollAttempts = 0;
-    let previousHeight = 0;
+    let previousCount = 0;
+    let staleRounds = 0;
 
-    while (placeLinks.size < maxResults && scrollAttempts < 30) {
+    log(`Scrolling to collect up to ${maxResults} place links...`);
+
+    while (placeLinks.size < maxResults && scrollAttempts < 60) {
+        // Collect all visible place links
         const links = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('a[href*="/maps/place/"]'))
                 .map(a => a.href)
@@ -479,24 +483,77 @@ async function scrollAndCollect(page, maxResults) {
             placeLinks.add(link);
         }
 
-        // Scroll
-        const newHeight = await page.evaluate(() => {
-            const c = document.querySelector('[role="feed"], [role="listbox"], .m6QErb');
-            if (c) { c.scrollTop = c.scrollHeight; return c.scrollHeight; }
-            return 0;
-        });
+        // Check if we found new links this round
+        if (placeLinks.size === previousCount) {
+            staleRounds++;
+        } else {
+            staleRounds = 0;
+        }
+        previousCount = placeLinks.size;
 
+        // Check for "end of results" indicator
         const endReached = await page.evaluate(() => {
-            const el = document.querySelector('.HlvSq');
-            return el?.textContent?.includes("You've reached the end") || false;
+            const body = document.body?.innerText || '';
+            return body.includes("You've reached the end") ||
+                   body.includes("No more results");
         });
 
-        if (endReached || (newHeight === previousHeight && scrollAttempts > 2)) break;
-        previousHeight = newHeight;
+        if (endReached) {
+            log(`End of results reached at ${placeLinks.size} links`);
+            break;
+        }
+
+        // Give up after 5 rounds with no new links
+        if (staleRounds >= 5) {
+            log(`No new links after ${staleRounds} scroll attempts, stopping at ${placeLinks.size}`);
+            break;
+        }
+
+        // Scroll the results panel — try multiple container selectors
+        await page.evaluate(() => {
+            // Try several known container selectors
+            const selectors = [
+                '[role="feed"]',
+                '[role="main"] [tabindex="-1"]',
+                '.m6QErb.DxyBCb',
+                '.m6QErb',
+                '[role="main"] div[aria-label]',
+            ];
+            for (const sel of selectors) {
+                const c = document.querySelector(sel);
+                if (c && c.scrollHeight > c.clientHeight) {
+                    c.scrollBy(0, 1000);
+                    return;
+                }
+            }
+            // Fallback: scroll the first scrollable div inside role="main"
+            const main = document.querySelector('[role="main"]');
+            if (main) {
+                const divs = main.querySelectorAll('div');
+                for (const d of divs) {
+                    if (d.scrollHeight > d.clientHeight + 100) {
+                        d.scrollBy(0, 1000);
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Also try keyboard scroll as backup
+        if (scrollAttempts % 3 === 0) {
+            await page.keyboard.press('End').catch(() => {});
+        }
+
         scrollAttempts++;
-        await sleep(600);
+        // Wait longer for content to lazy-load
+        await sleep(1500);
+
+        if (scrollAttempts % 10 === 0) {
+            log(`  Scroll progress: ${placeLinks.size} links after ${scrollAttempts} scrolls`);
+        }
     }
 
+    log(`Scroll complete: ${placeLinks.size} links after ${scrollAttempts} scrolls`);
     return Array.from(placeLinks);
 }
 
