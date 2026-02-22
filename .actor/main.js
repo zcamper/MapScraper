@@ -83,17 +83,18 @@ try {
     }
 
     // --- Set up proxy ---
-    log('Setting up proxy...');
+    // TEMPORARILY DISABLED for testing — proxy was causing 90s timeout
+    log('Proxy DISABLED for testing (ignoring proxyConfig)');
     let proxyUrl = null;
-    if (proxyConfig?.useApifyProxy) {
-        log('Creating Apify proxy configuration...');
-        const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
-        proxyUrl = await proxyConfiguration.newUrl();
-        const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
-        log(`Proxy URL: ${redacted}`);
-    } else {
-        log('No proxy configured');
-    }
+    // if (proxyConfig?.useApifyProxy) {
+    //     log('Creating Apify proxy configuration...');
+    //     const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
+    //     proxyUrl = await proxyConfiguration.newUrl();
+    //     const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
+    //     log(`Proxy URL: ${redacted}`);
+    // } else {
+    //     log('No proxy configured');
+    // }
 
     // --- Launch browser directly (bypass ProxyManager for Apify) ---
     log('Importing Playwright...');
