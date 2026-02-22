@@ -83,20 +83,19 @@ try {
     }
 
     // --- Set up proxy ---
-    // TEMPORARILY DISABLED for testing — proxy was causing 90s timeout
-    log('Proxy DISABLED for testing (ignoring proxyConfig)');
+    log('Setting up proxy...');
     let proxyUrl = null;
-    // if (proxyConfig?.useApifyProxy) {
-    //     log('Creating Apify proxy configuration...');
-    //     const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
-    //     proxyUrl = await proxyConfiguration.newUrl();
-    //     const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
-    //     log(`Proxy URL: ${redacted}`);
-    // } else {
-    //     log('No proxy configured');
-    // }
+    if (proxyConfig?.useApifyProxy) {
+        log('Creating Apify proxy configuration...');
+        const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
+        proxyUrl = await proxyConfiguration.newUrl();
+        const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
+        log(`Proxy URL: ${redacted}`);
+    } else {
+        log('No proxy configured');
+    }
 
-    // --- Launch browser directly (bypass ProxyManager for Apify) ---
+    // --- Launch browser ---
     log('Importing Playwright...');
     const pw = await import('playwright');
     chromium = pw.chromium;
@@ -108,48 +107,80 @@ try {
     log('JSDOM imported');
 
     // Parse Apify proxy URL for Playwright format
-    let playwrightProxy = undefined;
+    function parseProxyUrl(url) {
+        const parsed = new URL(url);
+        return {
+            server: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
+            username: decodeURIComponent(parsed.username),
+            password: decodeURIComponent(parsed.password),
+        };
+    }
+
+    // Try launching browser and navigating — with proxy fallback
+    let browser, context, page;
+    const mapsUrl = 'https://www.google.com/maps/?hl=' + language;
+
+    async function launchAndTest(proxyOpts, label) {
+        const opts = { headless: true };
+        if (proxyOpts) opts.proxy = proxyOpts;
+        log(`[${label}] Launching browser...`);
+        const b = await chromium.launch(opts);
+        const ctx = await b.newContext({
+            viewport: { width: 1280, height: 720 },
+            locale: language,
+        });
+        const p = await ctx.newPage();
+        p.setDefaultTimeout(90000);
+        p.setDefaultNavigationTimeout(90000);
+        log(`[${label}] Browser ready, navigating to Google Maps...`);
+        // Use 30s timeout for the connectivity test (not full 90s)
+        await p.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(3000);
+        log(`[${label}] Landed on: ${p.url()} (title: "${await p.title()}")`);
+        return { browser: b, context: ctx, page: p };
+    }
+
     if (proxyUrl) {
+        // Try with proxy first, fall back to direct if it times out
+        let playwrightProxy;
         try {
-            const parsed = new URL(proxyUrl);
-            playwrightProxy = {
-                server: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
-                username: decodeURIComponent(parsed.username),
-                password: decodeURIComponent(parsed.password),
-            };
+            playwrightProxy = parseProxyUrl(proxyUrl);
             log(`Proxy parsed: server=${playwrightProxy.server}, user=${playwrightProxy.username.substring(0, 10)}...`);
         } catch (e) {
             logErr(`Failed to parse proxy URL: ${e.message}`);
         }
+
+        if (playwrightProxy) {
+            try {
+                const result = await launchAndTest(playwrightProxy, 'PROXY');
+                browser = result.browser;
+                context = result.context;
+                page = result.page;
+                log('Proxy connection successful!');
+            } catch (e) {
+                log(`Proxy failed (${e.message}), falling back to direct connection...`);
+                // Try without proxy
+                const result = await launchAndTest(null, 'DIRECT');
+                browser = result.browser;
+                context = result.context;
+                page = result.page;
+                log('Direct connection successful (no proxy)');
+            }
+        } else {
+            const result = await launchAndTest(null, 'DIRECT');
+            browser = result.browser;
+            context = result.context;
+            page = result.page;
+        }
+    } else {
+        const result = await launchAndTest(null, 'DIRECT');
+        browser = result.browser;
+        context = result.context;
+        page = result.page;
     }
-
-    // Launch with proxy at browser level
-    const launchOptions = { headless: true };
-    if (playwrightProxy) {
-        launchOptions.proxy = playwrightProxy;
-    }
-
-    log('Launching browser...');
-    const browser = await chromium.launch(launchOptions);
-    log('Browser process launched');
-
-    const context = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
-        locale: language,
-    });
-    const page = await context.newPage();
-    page.setDefaultTimeout(90000);
-    page.setDefaultNavigationTimeout(90000);
-    log('Browser page ready');
-
-    // --- Test connectivity ---
-    log('Navigating to Google Maps...');
-    await page.goto('https://www.google.com/maps/?hl=' + language, { waitUntil: 'domcontentloaded' });
-    await sleep(3000);
 
     let currentUrl = page.url();
     let pageTitle = await page.title();
-    log(`Landed on: ${currentUrl} (title: "${pageTitle}")`);
     await saveScreenshot(page, 'step-1-initial-load');
 
     // --- Handle consent ---
