@@ -240,7 +240,6 @@ try {
 
         // Visit each place and extract data
         let results = [];
-        const emailQueue = [];
         const avgTimePerPlace = []; // Track actual time per place
 
         for (let j = 0; j < placeLinks.length; j++) {
@@ -397,6 +396,14 @@ try {
                 delete data.email;
                 data.scrapedAt = new Date().toISOString();
 
+                // Email enrichment — MUST happen before pushData so emails appear in dataset
+                if (scrapeEmails && data.website && data.emails.length === 0 && timeOk(30_000)) {
+                    try {
+                        const foundEmails = await scrapeEmailsFromWebsite(data.website);
+                        if (foundEmails.length > 0) data.emails = foundEmails;
+                    } catch {}
+                }
+
                 results.push(data);
 
                 // Push data incrementally so we don't lose results on timeout
@@ -406,15 +413,12 @@ try {
                     try { await Actor.charge({ eventName: 'review-scraped', count: data.reviews.length }); } catch {}
                 }
 
-                if (scrapeEmails && data.website && data.emails.length === 0) {
-                    emailQueue.push({ index: results.length - 1, website: data.website });
-                }
-
                 avgTimePerPlace.push(Date.now() - placeStart);
 
-                if ((j + 1) % 10 === 0) {
+                if ((j + 1) % 5 === 0) {
                     const avgMs = Math.round(avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length);
-                    log(`  Extracted ${j + 1}/${placeLinks.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
+                    const emailCount = results.filter(r => r.emails?.length > 0).length;
+                    log(`  Extracted ${j + 1}/${placeLinks.length} places (avg ${avgMs}ms/place, ${emailCount} emails, ${remaining()}ms left)`);
                 }
             } catch (e) {
                 log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
@@ -422,34 +426,10 @@ try {
             }
         }
 
-        // --- Email enrichment ---
+        // Summary stats
         const withWebsite = results.filter(r => r.website).length;
-        const withMapEmail = results.filter(r => r.emails?.length > 0).length;
-        log(`Email stats: ${withWebsite} have websites, ${withMapEmail} have emails from Maps, ${emailQueue.length} queued for enrichment`);
-
-        if (emailQueue.length > 0 && scrapeEmails && timeOk(15_000)) {
-            log(`Enriching emails for ${emailQueue.length} places...`);
-            for (let b = 0; b < emailQueue.length; b += 5) {
-                if (!timeOk(8_000)) {
-                    log(`  Email enrichment stopped at ${b}/${emailQueue.length} — time budget low`);
-                    break;
-                }
-                const batch = emailQueue.slice(b, b + 5);
-                const emailResults = await Promise.allSettled(
-                    batch.map(item => scrapeEmailsFromWebsite(item.website))
-                );
-                for (let k = 0; k < batch.length; k++) {
-                    if (emailResults[k].status === 'fulfilled' && emailResults[k].value.length > 0) {
-                        const idx = batch[k].index;
-                        results[idx].emails = emailResults[k].value;
-                        // Update the already-pushed dataset item isn't possible,
-                        // but the final dataset will have the enriched data
-                    }
-                }
-            }
-            const withEmails = results.filter(r => r.emails.length > 0).length;
-            log(`Email enrichment complete: found emails for ${withEmails}/${results.length} places`);
-        }
+        const withEmails = results.filter(r => r.emails?.length > 0).length;
+        log(`Email stats: ${withWebsite} have websites, ${withEmails} have emails`);
 
         // Apply filters
         if (minRating) results = filterByRating(results, minRating);
