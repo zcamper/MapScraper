@@ -9,15 +9,30 @@
  * need special handling.
  */
 
+console.log('[ACTOR] Script starting...');
+
+// Catch any unhandled errors at process level
+process.on('unhandledRejection', (reason) => {
+    console.error('[ACTOR] Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[ACTOR] Uncaught exception:', err);
+    process.exit(1);
+});
+
 import { Actor } from 'apify';
 
+console.log('[ACTOR] Calling Actor.init()...');
 await Actor.init();
+console.log('[ACTOR] Actor.init() completed');
 
 // Lazy-load heavy deps
 let chromium, JSDOM;
 
 try {
+    console.log('[ACTOR] Calling Actor.getInput()...');
     const input = await Actor.getInput() ?? {};
+    console.log('[ACTOR] Got input, searchTerms:', input.searchTerms);
     Actor.log.info('Input received', {
         searchTerms: input.searchTerms,
         location: input.location,
@@ -48,7 +63,10 @@ try {
         throw new Error('location is required when using searchTerms.');
     }
 
-    await Actor.charge({ eventName: 'actor-start', count: 1 });
+    console.log('[ACTOR] Charging actor-start event...');
+    await Actor.charge({ eventName: 'actor-start', count: 1 }).catch(e => {
+        console.log('[ACTOR] charge() warning (expected if not configured):', e.message);
+    });
 
     // --- Set up proxy ---
     let proxyUrl = null;
@@ -61,11 +79,14 @@ try {
     }
 
     // --- Launch browser directly (bypass ProxyManager for Apify) ---
+    console.log('[ACTOR] Loading Playwright...');
     Actor.log.info('Loading Playwright...');
     const pw = await import('playwright');
     chromium = pw.chromium;
+    console.log('[ACTOR] Playwright loaded, loading JSDOM...');
     const jsdomModule = await import('jsdom');
     JSDOM = jsdomModule.JSDOM;
+    console.log('[ACTOR] JSDOM loaded');
 
     // Parse Apify proxy URL for Playwright format
     let playwrightProxy = undefined;
