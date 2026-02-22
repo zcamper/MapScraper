@@ -94,6 +94,7 @@ try {
     const context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         locale: language,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     });
     const page = await context.newPage();
     page.setDefaultTimeout(30000);
@@ -512,28 +513,29 @@ async function scrollAndCollect(page, maxResults) {
         }
         previousCount = placeLinks.size;
 
-        // Check for end of results
-        const endReached = await page.evaluate(() => {
-            const endEl = document.querySelector('.HlvSq, .PbZDve, .lXJj5c');
-            if (endEl) {
-                const text = endEl.textContent || '';
-                if (text.includes("You've reached the end") || text.includes("end of list")) {
-                    return 'end-element';
+        // Check for end of results — but ONLY trust it after we've scrolled a few times
+        // Google Maps sometimes shows end-of-list elements even with few results loaded
+        if (scrollAttempts >= 3) {
+            const endReached = await page.evaluate(() => {
+                const endEl = document.querySelector('.HlvSq, .PbZDve, .lXJj5c');
+                if (endEl) {
+                    const text = endEl.textContent || '';
+                    if (text.includes("You've reached the end") || text.includes("end of list")) {
+                        return 'end-element: ' + text.substring(0, 100);
+                    }
                 }
-            }
-            const feed = document.querySelector('[role="feed"]');
-            if (feed && feed.lastElementChild) {
-                const text = feed.lastElementChild.textContent || '';
-                if (text.includes("You've reached the end")) return 'feed-last-child';
-            }
-            const noResults = document.querySelector('.Q2vNVc, .section-no-result-title');
-            if (noResults) return 'no-results';
-            return '';
-        });
+                const feed = document.querySelector('[role="feed"]');
+                if (feed && feed.lastElementChild) {
+                    const text = feed.lastElementChild.textContent || '';
+                    if (text.includes("You've reached the end")) return 'feed-last-child';
+                }
+                return '';
+            });
 
-        if (endReached) {
-            log(`End of results reached (${endReached}) at ${placeLinks.size} links`);
-            break;
+            if (endReached) {
+                log(`End of results reached (${endReached}) at ${placeLinks.size} links`);
+                break;
+            }
         }
 
         // When stale, try progressively more aggressive tactics
@@ -638,7 +640,14 @@ async function scrollAndCollect(page, maxResults) {
         await sleep(waitMs);
 
         if (scrollAttempts % 5 === 0) {
-            log(`  Scroll: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})`);
+            // Log scroll container state for debugging
+            const scrollState = await page.evaluate(() => {
+                const feed = document.querySelector('[role="feed"]');
+                if (feed) return { sh: feed.scrollHeight, st: feed.scrollTop, ch: feed.clientHeight };
+                return null;
+            });
+            const stateStr = scrollState ? ` [feed: ${scrollState.sh}h ${scrollState.st}st ${scrollState.ch}ch]` : '';
+            log(`  Scroll: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})${stateStr}`);
         }
     }
 
