@@ -308,6 +308,65 @@ try {
                     r.email = emailEl?.textContent?.trim() || '';
                     const mailto = document.querySelector('a[href^="mailto:"]');
                     if (mailto && !r.email) r.email = mailto.href.replace('mailto:', '').split('?')[0];
+                    // Price level
+                    const priceEl = document.querySelector('[aria-label*="Price" i]');
+                    if (priceEl) {
+                        const priceLabel = priceEl.getAttribute('aria-label') || '';
+                        const priceText = priceEl.textContent?.trim() || '';
+                        const dollarMatch = (priceLabel + ' ' + priceText).match(/(\${1,4})/);
+                        r.priceLevel = dollarMatch ? dollarMatch[1] : priceText;
+                    }
+                    // Description
+                    const descEl = document.querySelector('div.PYvSYb');
+                    r.description = descEl?.textContent?.trim() || '';
+                    // Opening hours from aria-label
+                    const ohBtn = document.querySelector('[data-item-id*="oh"]');
+                    if (ohBtn) {
+                        // Walk up to find aria-label with schedule
+                        let label = '';
+                        let el = ohBtn;
+                        for (let i = 0; i < 5 && el; i++) {
+                            const al = el.getAttribute('aria-label');
+                            if (al && al.includes(',') && (al.includes('AM') || al.includes('PM') || al.includes('am') || al.includes('pm') || al.includes('Open') || al.includes('Closed'))) {
+                                label = al;
+                                break;
+                            }
+                            el = el.parentElement;
+                        }
+                        if (label) {
+                            const parts = label.split(';').map(s => s.trim()).filter(Boolean);
+                            const schedule = {};
+                            for (const part of parts) {
+                                const commaIdx = part.indexOf(',');
+                                if (commaIdx > 0) {
+                                    const day = part.substring(0, commaIdx).trim();
+                                    const time = part.substring(commaIdx + 1).trim();
+                                    schedule[day] = time;
+                                }
+                            }
+                            r.openingHours = Object.keys(schedule).length > 0 ? schedule : label;
+                        } else {
+                            // Fallback: get current status text
+                            const statusText = ohBtn.querySelector('.fontBodyMedium')?.textContent?.trim() || '';
+                            if (statusText) r.openingHours = statusText;
+                        }
+                    }
+                    // Plus code
+                    const plusEl = document.querySelector('[data-item-id="oloc"] .Io6YTe, [data-item-id="oloc"] .rogA2c');
+                    r.plusCode = plusEl?.textContent?.trim() || '';
+                    // Service options (dine-in, takeout, delivery)
+                    const serviceEls = document.querySelectorAll('div.LTs0Rc');
+                    if (serviceEls.length > 0) {
+                        r.serviceOptions = {};
+                        serviceEls.forEach(el => {
+                            const label = el.getAttribute('aria-label') || el.textContent?.trim() || '';
+                            if (label) {
+                                // Check for check/cross icon
+                                const hasCheck = el.querySelector('[aria-label*="has" i], .google-symbols');
+                                r.serviceOptions[label] = !!hasCheck;
+                            }
+                        });
+                    }
                     // Status
                     const bodyText = document.body?.innerText || '';
                     r.permanentlyClosed = bodyText.includes('Permanently closed');
@@ -317,6 +376,43 @@ try {
 
                 if (!data.placeName) continue;
 
+                // Extract opening hours by clicking the hours section if we only got status text
+                if (scrapeOpeningHours && data.openingHours && typeof data.openingHours === 'string') {
+                    try {
+                        // Click the hours button to expand the full schedule
+                        await page.click('[data-item-id*="oh"]').catch(() => {});
+                        await sleep(1000);
+                        const fullHours = await page.evaluate(() => {
+                            // After clicking, look for the expanded hours table
+                            const rows = document.querySelectorAll('table.eK4R0e tr, table.WgFkxc tr, .lo7U087hsMA__row');
+                            if (rows.length > 0) {
+                                const schedule = {};
+                                rows.forEach(row => {
+                                    const cells = row.querySelectorAll('td, .lo7U087hsMA__cell');
+                                    if (cells.length >= 2) {
+                                        schedule[cells[0].textContent.trim()] = cells[1].textContent.trim();
+                                    }
+                                });
+                                return Object.keys(schedule).length > 0 ? schedule : null;
+                            }
+                            // Try aria-label on any newly-expanded element
+                            const expanded = document.querySelector('[data-item-id*="oh"] [aria-label*=","]');
+                            return expanded?.getAttribute('aria-label') || null;
+                        });
+                        if (fullHours) data.openingHours = fullHours;
+                    } catch {}
+                }
+
+                // Extract reviews if requested
+                if (scrapeReviews && reviewsLimit > 0) {
+                    try {
+                        data.reviews = await extractReviews(page, reviewsLimit);
+                    } catch (e) {
+                        log(`  Review extraction failed for place ${j + 1}: ${e.message}`);
+                        data.reviews = [];
+                    }
+                }
+
                 // Coordinates from URL
                 const coordMatch = page.url().match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) ||
                                    page.url().match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
@@ -325,6 +421,13 @@ try {
                         latitude: parseFloat(coordMatch[1]),
                         longitude: parseFloat(coordMatch[2]),
                     };
+                }
+                // Place ID from URL
+                const placeIdMatch = page.url().match(/place_id[=:]([A-Za-z0-9_-]+)/) ||
+                                     page.url().match(/!1s(0x[0-9a-f]+:[0-9a-fx]+)/i) ||
+                                     page.url().match(/!1s(ChIJ[A-Za-z0-9_-]+)/);
+                if (placeIdMatch) {
+                    data.placeId = placeIdMatch[1];
                 }
                 data.url = placeLinks[j];
                 data.emails = data.email ? [data.email] : [];
@@ -346,6 +449,9 @@ try {
         }
 
         // --- Email enrichment (uses fetch, not browser — much faster) ---
+        const withWebsite = results.filter(r => r.website).length;
+        const withMapEmail = results.filter(r => r.emails?.length > 0).length;
+        log(`Email enrichment: scrapeEmails=${scrapeEmails}, ${withWebsite} places have websites, ${withMapEmail} already have emails from Maps`);
         if (emailQueue.length > 0) {
             log(`Enriching emails for ${emailQueue.length} places with websites...`);
             // Process in parallel batches of 5
@@ -495,7 +601,25 @@ async function scrollAndCollect(page, maxResults) {
 
     log(`Scrolling to collect up to ${maxResults} place links...`);
 
-    while (placeLinks.size < maxResults && scrollAttempts < 60) {
+    // First, identify the scrollable container
+    const containerInfo = await page.evaluate(() => {
+        const selectors = [
+            '[role="feed"]',
+            '.m6QErb.DxyBCb',
+            '[role="main"] [tabindex="-1"]',
+            '.m6QErb',
+        ];
+        for (const sel of selectors) {
+            const c = document.querySelector(sel);
+            if (c && c.scrollHeight > c.clientHeight) {
+                return { selector: sel, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
+            }
+        }
+        return null;
+    });
+    log(`Scroll container: ${containerInfo ? `${containerInfo.selector} (${containerInfo.scrollHeight}h / ${containerInfo.clientHeight}ch)` : 'not found — will try all'}`);
+
+    while (placeLinks.size < maxResults && scrollAttempts < 80) {
         // Collect all visible place links
         const links = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('a[href*="/maps/place/"]'))
@@ -522,69 +646,81 @@ async function scrollAndCollect(page, maxResults) {
             const endEl = document.querySelector('.HlvSq, .PbZDve, .lXJj5c');
             if (endEl) {
                 const text = endEl.textContent || '';
-                return text.includes("You've reached the end") || text.includes("end of list");
+                if (text.includes("You've reached the end") || text.includes("end of list")) {
+                    return 'end-element';
+                }
             }
             // Also check the last child of the results feed
             const feed = document.querySelector('[role="feed"]');
             if (feed && feed.lastElementChild) {
                 const text = feed.lastElementChild.textContent || '';
-                return text.includes("You've reached the end");
+                if (text.includes("You've reached the end")) {
+                    return 'feed-last-child';
+                }
             }
-            return false;
+            // Check if there's a "No results" type message
+            const noResults = document.querySelector('.Q2vNVc, .section-no-result-title');
+            if (noResults) return 'no-results';
+            return '';
         });
 
         if (endReached) {
-            log(`End of results reached at ${placeLinks.size} links`);
+            log(`End of results reached (${endReached}) at ${placeLinks.size} links`);
             break;
         }
 
-        // Give up after 5 rounds with no new links
-        if (staleRounds >= 5) {
+        // Give up after 8 rounds with no new links (was 5, more patient now)
+        if (staleRounds >= 8) {
             log(`No new links after ${staleRounds} scroll attempts, stopping at ${placeLinks.size}`);
+            // Take screenshot for debugging
+            await saveScreenshot(page, `scroll-stale-${placeLinks.size}`).catch(() => {});
             break;
         }
 
-        // Scroll the results panel — try multiple container selectors
+        // Scroll the results panel
         await page.evaluate(() => {
-            // Try several known container selectors
             const selectors = [
                 '[role="feed"]',
-                '[role="main"] [tabindex="-1"]',
                 '.m6QErb.DxyBCb',
+                '[role="main"] [tabindex="-1"]',
                 '.m6QErb',
                 '[role="main"] div[aria-label]',
             ];
+            let scrolled = false;
             for (const sel of selectors) {
                 const c = document.querySelector(sel);
                 if (c && c.scrollHeight > c.clientHeight) {
-                    c.scrollBy(0, 1000);
-                    return;
+                    c.scrollBy(0, 2000);
+                    scrolled = true;
+                    break;
                 }
             }
-            // Fallback: scroll the first scrollable div inside role="main"
-            const main = document.querySelector('[role="main"]');
-            if (main) {
-                const divs = main.querySelectorAll('div');
-                for (const d of divs) {
-                    if (d.scrollHeight > d.clientHeight + 100) {
-                        d.scrollBy(0, 1000);
-                        return;
+            if (!scrolled) {
+                // Fallback: scroll the first scrollable div inside role="main"
+                const main = document.querySelector('[role="main"]');
+                if (main) {
+                    const divs = main.querySelectorAll('div');
+                    for (const d of divs) {
+                        if (d.scrollHeight > d.clientHeight + 100) {
+                            d.scrollBy(0, 2000);
+                            break;
+                        }
                     }
                 }
             }
         });
 
-        // Also try keyboard scroll as backup
-        if (scrollAttempts % 3 === 0) {
+        // Use keyboard End press more frequently as backup
+        if (scrollAttempts % 2 === 0) {
             await page.keyboard.press('End').catch(() => {});
         }
 
         scrollAttempts++;
-        // Wait longer for content to lazy-load
-        await sleep(1500);
+        // Wait for lazy-load (longer wait every few scrolls to let slow connections catch up)
+        await sleep(scrollAttempts % 5 === 0 ? 2500 : 1500);
 
-        if (scrollAttempts % 10 === 0) {
-            log(`  Scroll progress: ${placeLinks.size} links after ${scrollAttempts} scrolls`);
+        if (scrollAttempts % 5 === 0) {
+            log(`  Scroll progress: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})`);
         }
     }
 
@@ -592,39 +728,95 @@ async function scrollAndCollect(page, maxResults) {
     return Array.from(placeLinks);
 }
 
-async function extractLiveData(page) {
-    try {
-        return await page.evaluate(() => {
-            const result = {};
-            const ratingEl = document.querySelector('[role="img"][aria-label*="star" i]');
-            if (ratingEl) {
-                const m = (ratingEl.getAttribute('aria-label') || '').match(/([\d.]+)/);
-                if (m) result.rating = parseFloat(m[1]);
+/**
+ * Extract individual reviews from the place page.
+ * Clicks the Reviews tab, scrolls to load, then extracts each review.
+ */
+async function extractReviews(page, limit) {
+    // Click the Reviews tab
+    const tabClicked = await page.evaluate(() => {
+        const tabs = document.querySelectorAll('button[role="tab"]');
+        for (const tab of tabs) {
+            const label = (tab.getAttribute('aria-label') || tab.textContent || '').toLowerCase();
+            if (label.includes('review')) {
+                tab.click();
+                return true;
             }
-            const reviewEls = document.querySelectorAll('[aria-label*="review" i]');
-            for (const el of reviewEls) {
-                const m = (el.getAttribute('aria-label') || '').match(/([\d,]+)\s*review/i);
-                if (m) { result.reviewCount = parseInt(m[1].replace(/,/g, '')); break; }
+        }
+        // Also try clicking the review count link
+        const reviewLink = document.querySelector('[jsaction*="review"]');
+        if (reviewLink) { reviewLink.click(); return true; }
+        return false;
+    });
+
+    if (!tabClicked) return [];
+
+    // Wait for reviews to load
+    await sleep(2000);
+    await page.waitForSelector('div[data-review-id], div.jftiEf', { timeout: 5000 }).catch(() => {});
+
+    // Scroll the reviews panel to load more
+    const scrollRounds = Math.min(Math.ceil(limit / 3), 15);
+    for (let s = 0; s < scrollRounds; s++) {
+        const count = await page.$$eval('div[data-review-id], div.jftiEf', els => els.length);
+        if (count >= limit) break;
+
+        await page.evaluate(() => {
+            const containers = [
+                document.querySelector('.m6QErb.DxyBCb.kA9KIf'),
+                document.querySelector('.m6QErb.DxyBCb'),
+                document.querySelector('[role="main"] [tabindex="-1"]'),
+            ];
+            for (const c of containers) {
+                if (c && c.scrollHeight > c.clientHeight) {
+                    c.scrollBy(0, 800);
+                    return;
+                }
             }
-            const catBtn = document.querySelector('button[jsaction*="category"]');
-            if (catBtn) result.category = catBtn.textContent.trim();
-            const phoneEl = document.querySelector('[data-item-id*="phone"] .Io6YTe, [data-item-id*="phone"] .rogA2c');
-            if (phoneEl) result.phone = phoneEl.textContent.trim();
-            const webEl = document.querySelector('[data-item-id="authority"] a');
-            if (webEl) result.website = webEl.getAttribute('href') || '';
-            const addrEl = document.querySelector('[data-item-id="address"] .Io6YTe, [data-item-id="address"] .rogA2c');
-            if (addrEl) result.address = addrEl.textContent.trim();
-            // Check for email on the Maps page (rare but some businesses list it)
-            const emailEl = document.querySelector('[data-item-id*="email"] .Io6YTe, [data-item-id*="email"] .rogA2c');
-            if (emailEl) result.email = emailEl.textContent.trim();
-            // Also scan all text for mailto: links
-            const mailtoLinks = document.querySelectorAll('a[href^="mailto:"]');
-            if (mailtoLinks.length > 0) {
-                result.email = result.email || mailtoLinks[0].href.replace('mailto:', '').split('?')[0];
-            }
-            return result;
         });
-    } catch { return {}; }
+        await sleep(1200);
+    }
+
+    // Click all "See more" / "More" buttons to expand truncated reviews
+    await page.$$eval('button[aria-label="See more"], button.w8nwRe', btns => {
+        btns.slice(0, 20).forEach(b => b.click());
+    }).catch(() => {});
+    await sleep(500);
+
+    // Extract the reviews
+    const reviews = await page.evaluate((lim) => {
+        const reviewEls = document.querySelectorAll('div[data-review-id], div.jftiEf');
+        const results = [];
+        for (let i = 0; i < Math.min(reviewEls.length, lim); i++) {
+            const el = reviewEls[i];
+            const r = {};
+            r.reviewId = el.getAttribute('data-review-id') || '';
+
+            // Author
+            const authorBtn = el.querySelector('button[data-href*="/maps/contrib/"]');
+            r.author = authorBtn?.textContent?.trim() || el.querySelector('.d4r55')?.textContent?.trim() || '';
+
+            // Rating
+            const starEl = el.querySelector('[role="img"][aria-label*="star" i]');
+            if (starEl) {
+                const m = (starEl.getAttribute('aria-label') || '').match(/(\d+)/);
+                if (m) r.rating = parseInt(m[1]);
+            }
+
+            // Review text
+            const textEl = el.querySelector('.wiI7pd') || el.querySelector('div[tabindex="-1"][id][lang]') || el.querySelector('.MyEned span');
+            r.text = textEl?.textContent?.trim() || '';
+
+            // Date
+            const dateEl = el.querySelector('.rsqaWe');
+            r.date = dateEl?.textContent?.trim() || '';
+
+            if (r.author || r.text) results.push(r);
+        }
+        return results;
+    }, limit);
+
+    return reviews;
 }
 
 /**
