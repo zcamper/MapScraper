@@ -143,20 +143,28 @@ try {
 
         // Use the search box like a real user — direct URL navigation often
         // triggers Google's bot detection and returns very few results
-        const searchInput = page.locator('#searchboxinput');
-        const searchBoxVisible = await searchInput.isVisible({ timeout: 3000 }).catch(() => false);
+        // Try multiple search box selectors
+        let searchBoxUsed = false;
+        for (const sel of ['#searchboxinput', 'input[name="q"]', 'input[aria-label*="Search" i]']) {
+            try {
+                const input = page.locator(sel).first();
+                if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
+                    log(`Using search box (${sel})...`);
+                    await input.click();
+                    await input.fill('');
+                    await sleep(100);
+                    // Type character by character for more human-like behavior
+                    await input.fill(fullQuery);
+                    await sleep(200);
+                    await page.keyboard.press('Enter');
+                    await sleep(4000);
+                    searchBoxUsed = true;
+                    break;
+                }
+            } catch {}
+        }
 
-        if (searchBoxVisible) {
-            log('Using search box method...');
-            await searchInput.click();
-            await searchInput.fill('');
-            await sleep(200);
-            await searchInput.fill(fullQuery);
-            await sleep(300);
-            await page.keyboard.press('Enter');
-            await sleep(4000);
-        } else {
-            // Fallback to URL-based search
+        if (!searchBoxUsed) {
             log('Search box not found, using URL method...');
             const searchQuery = encodeURIComponent(fullQuery);
             const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
@@ -355,9 +363,12 @@ try {
 
                 if (!data.placeName) continue;
 
-                // Extract reviews if requested AND we have time budget
-                // Only do reviews if avg time per place allows it
-                const canDoReviews = scrapeReviews && reviewsLimit > 0 && timeOk(45_000);
+                // Extract reviews only if time budget allows extracting ALL remaining places
+                // Reviews add ~4s per place, so skip them if time is tight
+                const remainingPlaces = placeLinks.length - j - 1;
+                const timePerPlaceBase = 4000; // base time without reviews
+                const timeNeeded = remainingPlaces * timePerPlaceBase + 30_000; // + email enrichment buffer
+                const canDoReviews = scrapeReviews && reviewsLimit > 0 && remaining() > timeNeeded + 5000;
                 if (canDoReviews) {
                     try {
                         data.reviews = await extractReviews(page, reviewsLimit);
@@ -589,76 +600,61 @@ async function scrollAndCollect(page, maxResults) {
             }
         }
 
-        // When stale, try progressively more aggressive tactics
-        if (staleRounds >= 3) {
-            if (staleRounds === 3) {
-                log(`  Scroll stalling at ${placeLinks.size}, trying recovery tactics...`);
+        // When stale, check if the container is genuinely at its bottom
+        if (staleRounds >= 2) {
+            const atBottom = await page.evaluate(() => {
+                const feed = document.querySelector('[role="feed"]');
+                if (!feed) return false;
+                // At bottom if scrollTop + clientHeight >= scrollHeight - 5 (small tolerance)
+                return (feed.scrollTop + feed.clientHeight) >= (feed.scrollHeight - 5);
+            });
+
+            if (atBottom && staleRounds >= 3) {
+                log(`Container at absolute bottom with ${placeLinks.size} links — no more results to load`);
+                break;
             }
 
-            // Tactic 1: Scroll the last visible result into view to trigger lazy loading
-            if (staleRounds === 3 || staleRounds === 6) {
+            if (staleRounds === 2) {
+                log(`  Scroll stalling at ${placeLinks.size}, trying recovery...`);
+                // Scroll last result into view
                 await page.evaluate(() => {
                     const links = document.querySelectorAll('a[href*="/maps/place/"]');
-                    if (links.length > 0) {
-                        links[links.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
-                    }
+                    if (links.length > 0) links[links.length - 1].scrollIntoView({ block: 'end' });
                 });
                 await sleep(2000);
             }
 
-            // Tactic 2: Click on the feed to ensure focus, then use keyboard
-            if (staleRounds === 4 || staleRounds === 7) {
+            if (staleRounds === 3) {
+                // Focus feed + keyboard
                 await page.evaluate(() => {
                     const feed = document.querySelector('[role="feed"]');
                     if (feed) feed.click();
                 });
-                await sleep(300);
                 for (let k = 0; k < 5; k++) {
                     await page.keyboard.press('ArrowDown').catch(() => {});
-                    await sleep(100);
                 }
                 await page.keyboard.press('End').catch(() => {});
                 await sleep(2000);
             }
 
-            // Tactic 3: Look for "Show more results" or similar buttons
-            if (staleRounds === 5 || staleRounds === 8) {
+            if (staleRounds === 4) {
+                // Try "Show more" buttons
                 const clicked = await page.evaluate(() => {
-                    const btns = document.querySelectorAll('button, [role="button"]');
-                    for (const btn of btns) {
+                    for (const btn of document.querySelectorAll('button, [role="button"]')) {
                         const text = (btn.textContent || '').toLowerCase();
-                        if (text.includes('more results') || text.includes('show more') || text.includes('next page')) {
+                        if (text.includes('more results') || text.includes('show more')) {
                             btn.click();
                             return text.trim().substring(0, 50);
                         }
                     }
                     return '';
                 });
-                if (clicked) {
-                    log(`  Clicked "${clicked}" button`);
-                    await sleep(3000);
-                }
-            }
-
-            // Tactic 4: Scroll the container to its absolute maximum
-            if (staleRounds === 6 || staleRounds === 9) {
-                await page.evaluate(() => {
-                    const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '.m6QErb'];
-                    for (const sel of selectors) {
-                        const c = document.querySelector(sel);
-                        if (c && c.scrollHeight > c.clientHeight) {
-                            c.scrollTop = c.scrollHeight;
-                            return;
-                        }
-                    }
-                });
+                if (clicked) log(`  Clicked "${clicked}"`);
                 await sleep(2500);
             }
 
-            // Give up after 10 stale rounds (was 8)
-            if (staleRounds >= 10) {
-                log(`No new links after ${staleRounds} recovery attempts, stopping at ${placeLinks.size}`);
-                await saveScreenshot(page, `scroll-stale-${placeLinks.size}`).catch(() => {});
+            if (staleRounds >= 5) {
+                log(`No new links after ${staleRounds} attempts, stopping at ${placeLinks.size}`);
                 break;
             }
         } else {
