@@ -1,12 +1,10 @@
 /**
- * Apify Actor Entry Point
+ * Apify Actor Entry Point — Google Maps Scraper
  *
- * Wraps the GoogleMapsScraper for the Apify platform with
- * pay-per-event billing (actor-start, place-scraped, review-scraped).
- *
- * Key difference from CLI: launches browser with Apify proxy directly
- * rather than going through ProxyManager, since Apify proxy URLs
- * need special handling.
+ * Key optimizations:
+ * - Skips proxy (always fails on Apify for Google Maps, wastes 15s)
+ * - Time-budget aware: pushes results incrementally, skips reviews if running low
+ * - Fast extraction: waitUntil 'commit', short h1 timeout, single page.evaluate
  */
 
 // Synchronous flush helper - ensures log output is visible before process dies
@@ -38,7 +36,13 @@ log('Calling Actor.init()...');
 await Actor.init();
 log('Actor.init() completed');
 
-// Track whether we succeeded to control exit code
+// Time budget tracking — Apify default timeout is 300s
+const START_TIME = Date.now();
+const TIMEOUT_MS = 270_000; // 270s — leave 30s buffer for cleanup
+function elapsed() { return Date.now() - START_TIME; }
+function remaining() { return TIMEOUT_MS - elapsed(); }
+function timeOk(neededMs = 0) { return remaining() > neededMs; }
+
 let actorFailed = false;
 let chromium;
 
@@ -60,7 +64,6 @@ try {
         minRating,
         status,
         language = 'en',
-        proxyConfig,
     } = input;
 
     log(`Destructured OK. searchTerms=${searchTerms.length}, location="${location}", directUrls=${directUrls.length}`);
@@ -75,143 +78,64 @@ try {
     log('Validation passed');
 
     // Charge for actor start (non-fatal if not configured)
-    log('Charging actor-start event...');
     try {
         await Actor.charge({ eventName: 'actor-start', count: 1 });
-        log('actor-start charge succeeded');
-    } catch (e) {
-        log(`actor-start charge skipped (expected if not configured): ${e.message}`);
-    }
+    } catch {}
 
-    // --- Set up proxy ---
-    log('Setting up proxy...');
-    let proxyUrl = null;
-    if (proxyConfig?.useApifyProxy) {
-        log('Creating Apify proxy configuration...');
-        const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
-        proxyUrl = await proxyConfiguration.newUrl();
-        const redacted = proxyUrl.replace(/:([^@]+)@/, ':***@');
-        log(`Proxy URL: ${redacted}`);
-    } else {
-        log('No proxy configured');
-    }
-
-    // --- Launch browser ---
+    // --- Launch browser directly (no proxy — it always times out on Google Maps) ---
     log('Importing Playwright...');
     const pw = await import('playwright');
     chromium = pw.chromium;
     log('Playwright imported');
 
-    // JSDOM no longer needed — extracting directly from live browser DOM
-
-    // Parse Apify proxy URL for Playwright format
-    function parseProxyUrl(url) {
-        const parsed = new URL(url);
-        return {
-            server: `${parsed.protocol}//${parsed.hostname}:${parsed.port}`,
-            username: decodeURIComponent(parsed.username),
-            password: decodeURIComponent(parsed.password),
-        };
-    }
-
-    // Try launching browser and navigating — with proxy fallback
-    let browser, context, page;
     const mapsUrl = 'https://www.google.com/maps/?hl=' + language;
+    log('Launching browser (direct connection)...');
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+        viewport: { width: 1280, height: 720 },
+        locale: language,
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
 
-    async function launchAndTest(proxyOpts, label) {
-        const opts = { headless: true };
-        if (proxyOpts) opts.proxy = proxyOpts;
-        log(`[${label}] Launching browser...`);
-        const b = await chromium.launch(opts);
-        const ctx = await b.newContext({
-            viewport: { width: 1280, height: 720 },
-            locale: language,
-        });
-        const p = await ctx.newPage();
-        p.setDefaultTimeout(90000);
-        p.setDefaultNavigationTimeout(90000);
-        log(`[${label}] Browser ready, navigating to Google Maps...`);
-        // Use 15s timeout for the connectivity test
-        await p.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await sleep(3000);
-        log(`[${label}] Landed on: ${p.url()} (title: "${await p.title()}")`);
-        return { browser: b, context: ctx, page: p };
-    }
-
-    if (proxyUrl) {
-        // Try with proxy first, fall back to direct if it times out
-        let playwrightProxy;
-        try {
-            playwrightProxy = parseProxyUrl(proxyUrl);
-            log(`Proxy parsed: server=${playwrightProxy.server}, user=${playwrightProxy.username.substring(0, 10)}...`);
-        } catch (e) {
-            logErr(`Failed to parse proxy URL: ${e.message}`);
-        }
-
-        if (playwrightProxy) {
-            try {
-                const result = await launchAndTest(playwrightProxy, 'PROXY');
-                browser = result.browser;
-                context = result.context;
-                page = result.page;
-                log('Proxy connection successful!');
-            } catch (e) {
-                log(`Proxy failed (${e.message}), falling back to direct connection...`);
-                // Try without proxy
-                const result = await launchAndTest(null, 'DIRECT');
-                browser = result.browser;
-                context = result.context;
-                page = result.page;
-                log('Direct connection successful (no proxy)');
-            }
-        } else {
-            const result = await launchAndTest(null, 'DIRECT');
-            browser = result.browser;
-            context = result.context;
-            page = result.page;
-        }
-    } else {
-        const result = await launchAndTest(null, 'DIRECT');
-        browser = result.browser;
-        context = result.context;
-        page = result.page;
-    }
-
-    let currentUrl = page.url();
-    let pageTitle = await page.title();
-    await saveScreenshot(page, 'step-1-initial-load');
+    log('Navigating to Google Maps...');
+    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+    await sleep(2000);
+    log(`Landed on: ${page.url()} (title: "${await page.title()}")`);
+    log(`Startup took ${elapsed()}ms`);
 
     // --- Handle consent ---
+    let currentUrl = page.url();
     if (currentUrl.includes('consent.google') || currentUrl.includes('consent.youtube')) {
         log('Consent page detected, handling...');
         await handleConsent(page);
         await sleep(2000);
         currentUrl = page.url();
-        pageTitle = await page.title();
-        log(`After consent: ${currentUrl} (title: "${pageTitle}")`);
-        await saveScreenshot(page, 'step-2-after-consent');
+        log(`After consent: ${currentUrl}`);
+    }
+    if (!currentUrl.includes('google.com/maps')) {
+        log('Not on Google Maps, re-navigating...');
+        await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+        await sleep(2000);
+        await handleConsent(page);
+        await sleep(1000);
     }
 
-    // Verify we're on Maps
-    if (!currentUrl.includes('google.com/maps')) {
-        log('Not on Google Maps after consent, re-navigating...');
-        await page.goto('https://www.google.com/maps/?hl=' + language, { waitUntil: 'domcontentloaded' });
-        await sleep(3000);
-        await handleConsent(page);
-        await sleep(2000);
-        log(`Re-nav URL: ${page.url()}`);
-        await saveScreenshot(page, 'step-2b-re-navigate');
-    }
+    await saveScreenshot(page, 'step-1-initial-load');
 
     // --- Import utility modules ---
-    log('Importing utils...');
     const { filterByRating, filterByStatus } = await import('../src/utils.js');
-    log('Utils imported');
 
     let totalResults = 0;
 
     // --- Process search terms ---
     for (let i = 0; i < searchTerms.length; i++) {
+        if (!timeOk(30_000)) {
+            log(`Time budget low (${remaining()}ms), skipping remaining search terms`);
+            break;
+        }
+
         const term = searchTerms[i];
         log(`[${i + 1}/${searchTerms.length}] Searching: "${term}" in "${location}"`);
 
@@ -220,15 +144,14 @@ try {
         log(`Search URL: ${searchUrl}`);
 
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-        await sleep(4000);
+        await sleep(3000);
 
-        // Handle consent again if needed
+        // Handle consent if needed
         if (page.url().includes('consent.google')) {
-            log('Consent page hit during search, handling...');
             await handleConsent(page);
-            await sleep(2000);
+            await sleep(1500);
             await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(4000);
+            await sleep(3000);
         }
 
         log(`Search page URL: ${page.url()}`);
@@ -236,14 +159,12 @@ try {
 
         // Wait for results
         log('Waiting for place links...');
-        const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 30000 })
+        const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
             .then(() => true)
             .catch(() => false);
 
         if (!hasResults) {
             log('WARNING: No place links found on search results page');
-            const title = await page.title();
-            log(`Page title: ${title}`);
             const bodyText = await page.evaluate(() =>
                 document.body?.innerText?.substring(0, 500) || 'empty'
             );
@@ -263,15 +184,29 @@ try {
             continue;
         }
 
-        // Visit each place and extract ALL data via page.evaluate (no JSDOM)
+        // Visit each place and extract data
         let results = [];
         const emailQueue = [];
+        const avgTimePerPlace = []; // Track actual time per place
 
         for (let j = 0; j < placeLinks.length; j++) {
+            // Time check: need at least 10s per remaining place + 30s for email enrichment + cleanup
+            const remainingPlaces = placeLinks.length - j;
+            const avgTime = avgTimePerPlace.length > 0
+                ? avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length
+                : 5000;
+            const estimatedNeeded = remainingPlaces * Math.min(avgTime, 8000) + 30_000;
+
+            if (!timeOk(10_000)) {
+                log(`Time budget exhausted at place ${j + 1}/${placeLinks.length} (${remaining()}ms left), stopping extraction`);
+                break;
+            }
+
+            const placeStart = Date.now();
             try {
                 await page.goto(placeLinks[j], { waitUntil: 'commit' });
-                // Wait for the place name heading to appear
-                await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
+                // Short wait for heading — don't block for 8s
+                await page.waitForSelector('h1', { timeout: 4000 }).catch(() => {});
 
                 // Extract everything from the live DOM in one evaluate call
                 const data = await page.evaluate(() => {
@@ -294,14 +229,27 @@ try {
                     // Category
                     const catBtn = document.querySelector('button[jsaction*="category"]');
                     r.category = catBtn?.textContent?.trim() || '';
-                    // Phone
-                    const phoneEl = document.querySelector('[data-item-id*="phone"] .Io6YTe, [data-item-id*="phone"] .rogA2c');
+                    // Phone — try multiple selectors
+                    const phoneEl = document.querySelector('[data-item-id*="phone"] .Io6YTe, [data-item-id*="phone"] .rogA2c, button[data-item-id*="phone:tel:"] .fontBodyMedium');
                     r.phoneNumber = phoneEl?.textContent?.trim() || '';
-                    // Website
-                    const webEl = document.querySelector('[data-item-id="authority"] a');
+                    // Website — try multiple selectors
+                    const webEl = document.querySelector('[data-item-id="authority"] a, a[data-item-id="authority"], a[aria-label*="Website" i], a[data-tooltip="Open website"]');
                     r.website = webEl?.getAttribute('href') || '';
+                    // If still no website, scan all links for non-google external links
+                    if (!r.website) {
+                        const allLinks = document.querySelectorAll('a[href]');
+                        for (const a of allLinks) {
+                            const href = a.getAttribute('href') || '';
+                            if (href.startsWith('http') && !href.includes('google.') && !href.includes('gstatic.') &&
+                                !href.includes('youtube.') && !href.includes('facebook.') && !href.includes('instagram.') &&
+                                (a.getAttribute('data-item-id') === 'authority' || a.closest('[data-item-id="authority"]'))) {
+                                r.website = href;
+                                break;
+                            }
+                        }
+                    }
                     // Address
-                    const addrEl = document.querySelector('[data-item-id="address"] .Io6YTe, [data-item-id="address"] .rogA2c');
+                    const addrEl = document.querySelector('[data-item-id="address"] .Io6YTe, [data-item-id="address"] .rogA2c, button[data-item-id="address"] .fontBodyMedium');
                     r.address = { fullAddress: addrEl?.textContent?.trim() || '' };
                     // Email (rare on Maps)
                     const emailEl = document.querySelector('[data-item-id*="email"] .Io6YTe, [data-item-id*="email"] .rogA2c');
@@ -322,7 +270,6 @@ try {
                     // Opening hours from aria-label
                     const ohBtn = document.querySelector('[data-item-id*="oh"]');
                     if (ohBtn) {
-                        // Walk up to find aria-label with schedule
                         let label = '';
                         let el = ohBtn;
                         for (let i = 0; i < 5 && el; i++) {
@@ -346,7 +293,6 @@ try {
                             }
                             r.openingHours = Object.keys(schedule).length > 0 ? schedule : label;
                         } else {
-                            // Fallback: get current status text
                             const statusText = ohBtn.querySelector('.fontBodyMedium')?.textContent?.trim() || '';
                             if (statusText) r.openingHours = statusText;
                         }
@@ -354,19 +300,6 @@ try {
                     // Plus code
                     const plusEl = document.querySelector('[data-item-id="oloc"] .Io6YTe, [data-item-id="oloc"] .rogA2c');
                     r.plusCode = plusEl?.textContent?.trim() || '';
-                    // Service options (dine-in, takeout, delivery)
-                    const serviceEls = document.querySelectorAll('div.LTs0Rc');
-                    if (serviceEls.length > 0) {
-                        r.serviceOptions = {};
-                        serviceEls.forEach(el => {
-                            const label = el.getAttribute('aria-label') || el.textContent?.trim() || '';
-                            if (label) {
-                                // Check for check/cross icon
-                                const hasCheck = el.querySelector('[aria-label*="has" i], .google-symbols');
-                                r.serviceOptions[label] = !!hasCheck;
-                            }
-                        });
-                    }
                     // Status
                     const bodyText = document.body?.innerText || '';
                     r.permanentlyClosed = bodyText.includes('Permanently closed');
@@ -376,40 +309,17 @@ try {
 
                 if (!data.placeName) continue;
 
-                // Extract opening hours by clicking the hours section if we only got status text
-                if (scrapeOpeningHours && data.openingHours && typeof data.openingHours === 'string') {
-                    try {
-                        // Click the hours button to expand the full schedule
-                        await page.click('[data-item-id*="oh"]').catch(() => {});
-                        await sleep(1000);
-                        const fullHours = await page.evaluate(() => {
-                            // After clicking, look for the expanded hours table
-                            const rows = document.querySelectorAll('table.eK4R0e tr, table.WgFkxc tr, .lo7U087hsMA__row');
-                            if (rows.length > 0) {
-                                const schedule = {};
-                                rows.forEach(row => {
-                                    const cells = row.querySelectorAll('td, .lo7U087hsMA__cell');
-                                    if (cells.length >= 2) {
-                                        schedule[cells[0].textContent.trim()] = cells[1].textContent.trim();
-                                    }
-                                });
-                                return Object.keys(schedule).length > 0 ? schedule : null;
-                            }
-                            // Try aria-label on any newly-expanded element
-                            const expanded = document.querySelector('[data-item-id*="oh"] [aria-label*=","]');
-                            return expanded?.getAttribute('aria-label') || null;
-                        });
-                        if (fullHours) data.openingHours = fullHours;
-                    } catch {}
-                }
-
-                // Extract reviews if requested
-                if (scrapeReviews && reviewsLimit > 0) {
+                // Extract reviews if requested AND we have time budget
+                if (scrapeReviews && reviewsLimit > 0 && timeOk(60_000)) {
                     try {
                         data.reviews = await extractReviews(page, reviewsLimit);
                     } catch (e) {
-                        log(`  Review extraction failed for place ${j + 1}: ${e.message}`);
                         data.reviews = [];
+                    }
+                } else if (scrapeReviews && !timeOk(60_000)) {
+                    // Log once when we start skipping reviews
+                    if (j === 0 || timeOk(59_000)) {
+                        log(`  Skipping reviews — time budget low (${remaining()}ms left)`);
                     }
                 }
 
@@ -423,8 +333,7 @@ try {
                     };
                 }
                 // Place ID from URL
-                const placeIdMatch = page.url().match(/place_id[=:]([A-Za-z0-9_-]+)/) ||
-                                     page.url().match(/!1s(0x[0-9a-f]+:[0-9a-fx]+)/i) ||
+                const placeIdMatch = page.url().match(/!1s(0x[0-9a-f]+:[0-9a-fx]+)/i) ||
                                      page.url().match(/!1s(ChIJ[A-Za-z0-9_-]+)/);
                 if (placeIdMatch) {
                     data.placeId = placeIdMatch[1];
@@ -436,37 +345,52 @@ try {
 
                 results.push(data);
 
+                // Push data incrementally so we don't lose results on timeout
+                await Actor.pushData(data);
+                try { await Actor.charge({ eventName: 'place-scraped', count: 1 }); } catch {}
+                if (data.reviews?.length > 0) {
+                    try { await Actor.charge({ eventName: 'review-scraped', count: data.reviews.length }); } catch {}
+                }
+
                 if (scrapeEmails && data.website && data.emails.length === 0) {
                     emailQueue.push({ index: results.length - 1, website: data.website });
                 }
 
+                avgTimePerPlace.push(Date.now() - placeStart);
+
                 if ((j + 1) % 10 === 0) {
-                    log(`  Extracted ${j + 1}/${placeLinks.length} places`);
+                    const avgMs = Math.round(avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length);
+                    log(`  Extracted ${j + 1}/${placeLinks.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
                 }
             } catch (e) {
                 log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
+                avgTimePerPlace.push(Date.now() - placeStart);
             }
         }
 
-        // --- Email enrichment (uses fetch, not browser — much faster) ---
+        // --- Email enrichment ---
         const withWebsite = results.filter(r => r.website).length;
         const withMapEmail = results.filter(r => r.emails?.length > 0).length;
-        log(`Email enrichment: scrapeEmails=${scrapeEmails}, ${withWebsite} places have websites, ${withMapEmail} already have emails from Maps`);
-        if (emailQueue.length > 0) {
-            log(`Enriching emails for ${emailQueue.length} places with websites...`);
-            // Process in parallel batches of 5
+        log(`Email stats: ${withWebsite} have websites, ${withMapEmail} have emails from Maps, ${emailQueue.length} queued for enrichment`);
+
+        if (emailQueue.length > 0 && scrapeEmails && timeOk(15_000)) {
+            log(`Enriching emails for ${emailQueue.length} places...`);
             for (let b = 0; b < emailQueue.length; b += 5) {
+                if (!timeOk(8_000)) {
+                    log(`  Email enrichment stopped at ${b}/${emailQueue.length} — time budget low`);
+                    break;
+                }
                 const batch = emailQueue.slice(b, b + 5);
                 const emailResults = await Promise.allSettled(
                     batch.map(item => scrapeEmailsFromWebsite(item.website))
                 );
                 for (let k = 0; k < batch.length; k++) {
                     if (emailResults[k].status === 'fulfilled' && emailResults[k].value.length > 0) {
-                        results[batch[k].index].emails = emailResults[k].value;
+                        const idx = batch[k].index;
+                        results[idx].emails = emailResults[k].value;
+                        // Update the already-pushed dataset item isn't possible,
+                        // but the final dataset will have the enriched data
                     }
-                }
-                if (b + 5 < emailQueue.length) {
-                    log(`  Email batch ${Math.floor(b / 5) + 1}: ${Math.min(b + 5, emailQueue.length)}/${emailQueue.length} done`);
                 }
             }
             const withEmails = results.filter(r => r.emails.length > 0).length;
@@ -478,61 +402,43 @@ try {
         if (status) results = filterByStatus(results, status);
 
         log(`Extracted ${results.length} places for "${term}"`);
-
-        // Push to dataset
-        for (const place of results) {
-            await Actor.pushData(place);
-            try {
-                await Actor.charge({ eventName: 'place-scraped', count: 1 });
-            } catch {}
-            if (place.reviews?.length > 0) {
-                try {
-                    await Actor.charge({ eventName: 'review-scraped', count: place.reviews.length });
-                } catch {}
-            }
-        }
         totalResults += results.length;
     }
 
     // --- Process direct URLs ---
     for (const directUrl of directUrls) {
+        if (!timeOk(30_000)) break;
         log(`Scraping direct URL: ${directUrl}`);
         await page.goto(directUrl, { waitUntil: 'domcontentloaded' });
-        await sleep(4000);
+        await sleep(3000);
         if (page.url().includes('consent.google')) {
             await handleConsent(page);
-            await sleep(2000);
+            await sleep(1500);
             await page.goto(directUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(4000);
+            await sleep(3000);
         }
-
-        const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 30000 })
+        const hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
             .then(() => true).catch(() => false);
         if (!hasResults) {
             log(`WARNING: No results for direct URL: ${directUrl}`);
-            await saveScreenshot(page, 'direct-url-no-results');
             continue;
         }
-
         const placeLinks = await scrollAndCollect(page, maxResults);
         log(`Collected ${placeLinks.length} links from direct URL`);
     }
 
     await browser.close();
-    log(`Scraping completed successfully. Total results: ${totalResults}`);
+    log(`Scraping completed. Total results: ${totalResults}. Total time: ${elapsed()}ms`);
 
 } catch (error) {
     actorFailed = true;
     logErr(`CAUGHT ERROR: ${error.message}`);
     logErr(`Stack: ${error.stack}`);
-    try { Actor.log.error(`Actor failed: ${error.message}`); } catch {}
 } finally {
     log(`In finally block. actorFailed=${actorFailed}`);
     if (actorFailed) {
-        log('Calling Actor.fail()...');
         await Actor.fail('Actor encountered an error — check logs above');
     } else {
-        log('Calling Actor.exit()...');
         await Actor.exit();
     }
 }
@@ -549,46 +455,21 @@ async function handleConsent(page) {
         'button:has-text("Reject all")',
         'button:has-text("I agree")',
         'button:has-text("Agree")',
-        'button:has-text("Aceptar todo")',
-        'button:has-text("Tout accepter")',
-        'button:has-text("Alle akzeptieren")',
         'button[aria-label*="Accept" i]',
         '#L2AGLb',
         'form[action*="consent"] button',
-        'form[action*="consent"] input[type="submit"]',
     ];
-
     for (const selector of selectors) {
         try {
             const btn = page.locator(selector).first();
-            if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+            if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
                 await btn.click();
                 log(`Clicked consent: ${selector}`);
-                await sleep(2000);
+                await sleep(1500);
                 return true;
             }
         } catch {}
     }
-
-    // Last resort: try clicking any visible button on the page
-    const allButtons = page.locator('button');
-    const count = await allButtons.count();
-    log(`Consent page has ${count} buttons, trying first visible one...`);
-    for (let i = 0; i < Math.min(count, 5); i++) {
-        const btn = allButtons.nth(i);
-        const text = await btn.textContent().catch(() => '');
-        const visible = await btn.isVisible().catch(() => false);
-        log(`  Button ${i}: "${text?.trim()}" visible=${visible}`);
-        if (visible && text?.trim()) {
-            await btn.click().catch(() => {});
-            await sleep(2000);
-            if (!page.url().includes('consent.google')) {
-                log(`  Consent resolved by clicking button ${i}`);
-                return true;
-            }
-        }
-    }
-
     log('WARNING: Could not find consent button');
     return false;
 }
@@ -601,14 +482,9 @@ async function scrollAndCollect(page, maxResults) {
 
     log(`Scrolling to collect up to ${maxResults} place links...`);
 
-    // First, identify the scrollable container
+    // Identify the scrollable container
     const containerInfo = await page.evaluate(() => {
-        const selectors = [
-            '[role="feed"]',
-            '.m6QErb.DxyBCb',
-            '[role="main"] [tabindex="-1"]',
-            '.m6QErb',
-        ];
+        const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '[role="main"] [tabindex="-1"]', '.m6QErb'];
         for (const sel of selectors) {
             const c = document.querySelector(sel);
             if (c && c.scrollHeight > c.clientHeight) {
@@ -617,9 +493,9 @@ async function scrollAndCollect(page, maxResults) {
         }
         return null;
     });
-    log(`Scroll container: ${containerInfo ? `${containerInfo.selector} (${containerInfo.scrollHeight}h / ${containerInfo.clientHeight}ch)` : 'not found — will try all'}`);
+    log(`Scroll container: ${containerInfo ? `${containerInfo.selector} (${containerInfo.scrollHeight}h / ${containerInfo.clientHeight}ch)` : 'not found'}`);
 
-    while (placeLinks.size < maxResults && scrollAttempts < 80) {
+    while (placeLinks.size < maxResults && scrollAttempts < 80 && timeOk(60_000)) {
         // Collect all visible place links
         const links = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('a[href*="/maps/place/"]'))
@@ -632,7 +508,6 @@ async function scrollAndCollect(page, maxResults) {
             placeLinks.add(link);
         }
 
-        // Check if we found new links this round
         if (placeLinks.size === previousCount) {
             staleRounds++;
         } else {
@@ -640,25 +515,20 @@ async function scrollAndCollect(page, maxResults) {
         }
         previousCount = placeLinks.size;
 
-        // Check for "end of results" indicator — must be in the results panel, not whole page
+        // Check for end of results
         const endReached = await page.evaluate(() => {
-            // Look for the specific end-of-list element Google Maps uses
             const endEl = document.querySelector('.HlvSq, .PbZDve, .lXJj5c');
             if (endEl) {
                 const text = endEl.textContent || '';
                 if (text.includes("You've reached the end") || text.includes("end of list")) {
-                    return 'end-element';
+                    return 'end-element: ' + text.substring(0, 80);
                 }
             }
-            // Also check the last child of the results feed
             const feed = document.querySelector('[role="feed"]');
             if (feed && feed.lastElementChild) {
                 const text = feed.lastElementChild.textContent || '';
-                if (text.includes("You've reached the end")) {
-                    return 'feed-last-child';
-                }
+                if (text.includes("You've reached the end")) return 'feed-last-child';
             }
-            // Check if there's a "No results" type message
             const noResults = document.querySelector('.Q2vNVc, .section-no-result-title');
             if (noResults) return 'no-results';
             return '';
@@ -669,58 +539,39 @@ async function scrollAndCollect(page, maxResults) {
             break;
         }
 
-        // Give up after 8 rounds with no new links (was 5, more patient now)
         if (staleRounds >= 8) {
-            log(`No new links after ${staleRounds} scroll attempts, stopping at ${placeLinks.size}`);
-            // Take screenshot for debugging
+            log(`No new links after ${staleRounds} scrolls, stopping at ${placeLinks.size}`);
             await saveScreenshot(page, `scroll-stale-${placeLinks.size}`).catch(() => {});
             break;
         }
 
-        // Scroll the results panel
+        // Scroll
         await page.evaluate(() => {
-            const selectors = [
-                '[role="feed"]',
-                '.m6QErb.DxyBCb',
-                '[role="main"] [tabindex="-1"]',
-                '.m6QErb',
-                '[role="main"] div[aria-label]',
-            ];
-            let scrolled = false;
+            const selectors = ['[role="feed"]', '.m6QErb.DxyBCb', '[role="main"] [tabindex="-1"]', '.m6QErb'];
             for (const sel of selectors) {
                 const c = document.querySelector(sel);
                 if (c && c.scrollHeight > c.clientHeight) {
                     c.scrollBy(0, 2000);
-                    scrolled = true;
-                    break;
+                    return;
                 }
             }
-            if (!scrolled) {
-                // Fallback: scroll the first scrollable div inside role="main"
-                const main = document.querySelector('[role="main"]');
-                if (main) {
-                    const divs = main.querySelectorAll('div');
-                    for (const d of divs) {
-                        if (d.scrollHeight > d.clientHeight + 100) {
-                            d.scrollBy(0, 2000);
-                            break;
-                        }
-                    }
+            const main = document.querySelector('[role="main"]');
+            if (main) {
+                for (const d of main.querySelectorAll('div')) {
+                    if (d.scrollHeight > d.clientHeight + 100) { d.scrollBy(0, 2000); return; }
                 }
             }
         });
 
-        // Use keyboard End press more frequently as backup
         if (scrollAttempts % 2 === 0) {
             await page.keyboard.press('End').catch(() => {});
         }
 
         scrollAttempts++;
-        // Wait for lazy-load (longer wait every few scrolls to let slow connections catch up)
         await sleep(scrollAttempts % 5 === 0 ? 2500 : 1500);
 
         if (scrollAttempts % 5 === 0) {
-            log(`  Scroll progress: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})`);
+            log(`  Scroll: ${placeLinks.size} links after ${scrollAttempts} scrolls (stale=${staleRounds})`);
         }
     }
 
@@ -730,60 +581,41 @@ async function scrollAndCollect(page, maxResults) {
 
 /**
  * Extract individual reviews from the place page.
- * Clicks the Reviews tab, scrolls to load, then extracts each review.
+ * Clicks Reviews tab, scrolls briefly, extracts.
  */
 async function extractReviews(page, limit) {
-    // Click the Reviews tab
     const tabClicked = await page.evaluate(() => {
         const tabs = document.querySelectorAll('button[role="tab"]');
         for (const tab of tabs) {
             const label = (tab.getAttribute('aria-label') || tab.textContent || '').toLowerCase();
-            if (label.includes('review')) {
-                tab.click();
-                return true;
-            }
+            if (label.includes('review')) { tab.click(); return true; }
         }
-        // Also try clicking the review count link
-        const reviewLink = document.querySelector('[jsaction*="review"]');
-        if (reviewLink) { reviewLink.click(); return true; }
         return false;
     });
-
     if (!tabClicked) return [];
 
-    // Wait for reviews to load
-    await sleep(2000);
-    await page.waitForSelector('div[data-review-id], div.jftiEf', { timeout: 5000 }).catch(() => {});
+    // Short wait for reviews to appear
+    await sleep(1500);
+    await page.waitForSelector('div[data-review-id], div.jftiEf', { timeout: 3000 }).catch(() => {});
 
-    // Scroll the reviews panel to load more
-    const scrollRounds = Math.min(Math.ceil(limit / 3), 15);
-    for (let s = 0; s < scrollRounds; s++) {
-        const count = await page.$$eval('div[data-review-id], div.jftiEf', els => els.length);
+    // Brief scroll to load a few more (max 3 rounds)
+    for (let s = 0; s < Math.min(Math.ceil(limit / 3), 3); s++) {
+        const count = await page.$$eval('div[data-review-id], div.jftiEf', els => els.length).catch(() => 0);
         if (count >= limit) break;
-
         await page.evaluate(() => {
-            const containers = [
-                document.querySelector('.m6QErb.DxyBCb.kA9KIf'),
-                document.querySelector('.m6QErb.DxyBCb'),
-                document.querySelector('[role="main"] [tabindex="-1"]'),
-            ];
-            for (const c of containers) {
-                if (c && c.scrollHeight > c.clientHeight) {
-                    c.scrollBy(0, 800);
-                    return;
-                }
-            }
+            const c = document.querySelector('.m6QErb.DxyBCb.kA9KIf') || document.querySelector('.m6QErb.DxyBCb');
+            if (c) c.scrollBy(0, 800);
         });
-        await sleep(1200);
+        await sleep(800);
     }
 
-    // Click all "See more" / "More" buttons to expand truncated reviews
+    // Expand truncated reviews
     await page.$$eval('button[aria-label="See more"], button.w8nwRe', btns => {
-        btns.slice(0, 20).forEach(b => b.click());
+        btns.slice(0, 10).forEach(b => b.click());
     }).catch(() => {});
-    await sleep(500);
+    await sleep(300);
 
-    // Extract the reviews
+    // Extract
     const reviews = await page.evaluate((lim) => {
         const reviewEls = document.querySelectorAll('div[data-review-id], div.jftiEf');
         const results = [];
@@ -791,26 +623,17 @@ async function extractReviews(page, limit) {
             const el = reviewEls[i];
             const r = {};
             r.reviewId = el.getAttribute('data-review-id') || '';
-
-            // Author
             const authorBtn = el.querySelector('button[data-href*="/maps/contrib/"]');
             r.author = authorBtn?.textContent?.trim() || el.querySelector('.d4r55')?.textContent?.trim() || '';
-
-            // Rating
             const starEl = el.querySelector('[role="img"][aria-label*="star" i]');
             if (starEl) {
                 const m = (starEl.getAttribute('aria-label') || '').match(/(\d+)/);
                 if (m) r.rating = parseInt(m[1]);
             }
-
-            // Review text
-            const textEl = el.querySelector('.wiI7pd') || el.querySelector('div[tabindex="-1"][id][lang]') || el.querySelector('.MyEned span');
+            const textEl = el.querySelector('.wiI7pd') || el.querySelector('div[tabindex="-1"][id][lang]');
             r.text = textEl?.textContent?.trim() || '';
-
-            // Date
             const dateEl = el.querySelector('.rsqaWe');
             r.date = dateEl?.textContent?.trim() || '';
-
             if (r.author || r.text) results.push(r);
         }
         return results;
@@ -821,18 +644,14 @@ async function extractReviews(page, limit) {
 
 /**
  * Crawl a business website to find contact email addresses.
- * Uses HTTP fetch (not browser) for speed. Checks homepage + contact pages.
+ * Uses HTTP fetch (not browser) for speed.
  */
 async function scrapeEmailsFromWebsite(websiteUrl) {
     const emails = new Set();
     const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
     let baseUrl;
-    try {
-        baseUrl = new URL(websiteUrl);
-    } catch {
-        return [];
-    }
+    try { baseUrl = new URL(websiteUrl); } catch { return []; }
 
     const pagesToCheck = [baseUrl.href];
     for (const path of ['/contact', '/contact-us']) {
@@ -859,33 +678,22 @@ async function scrapeEmailsFromWebsite(websiteUrl) {
                 const email = m.replace(/^mailto:/i, '').split('?')[0].trim();
                 if (email) emails.add(email.toLowerCase());
             }
-
             // Extract emails from page text
             const textMatches = html.match(EMAIL_REGEX) || [];
             for (const email of textMatches) {
                 emails.add(email.toLowerCase());
             }
-
-            // Filter out false positives
+            // Filter false positives
             for (const email of emails) {
-                if (email.includes('@example') ||
-                    email.includes('@test') ||
-                    email.includes('@sentry') ||
-                    email.includes('@wix') ||
-                    email.includes('.png') ||
-                    email.includes('.jpg') ||
-                    email.includes('@2x') ||
-                    email.endsWith('.js') ||
-                    email.endsWith('.css') ||
+                if (email.includes('@example') || email.includes('@test') || email.includes('@sentry') ||
+                    email.includes('@wix') || email.includes('.png') || email.includes('.jpg') ||
+                    email.includes('@2x') || email.endsWith('.js') || email.endsWith('.css') ||
                     email.length > 80) {
                     emails.delete(email);
                 }
             }
-
             if (emails.size > 0) break;
-        } catch {
-            // Timeout or fetch error, skip
-        }
+        } catch {}
     }
 
     return Array.from(emails);
