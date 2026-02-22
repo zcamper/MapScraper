@@ -84,9 +84,9 @@
         "proxyConfig": {
             "title": "Proxy Configuration",
             "type": "object",
-            "description": "Proxy settings for avoiding blocks. Apify Proxy recommended.",
+            "description": "Proxy settings for avoiding blocks. Enable Apify Proxy if you get blocked.",
             "editor": "proxy",
-            "prefill": { "useApifyProxy": true },
+            "prefill": { "useApifyProxy": false },
             "sectionCaption": "Proxy"
         }
     },
