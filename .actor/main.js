@@ -33,13 +33,8 @@ try {
     console.log('[ACTOR] Calling Actor.getInput()...');
     const input = await Actor.getInput() ?? {};
     console.log('[ACTOR] Got input, searchTerms:', input.searchTerms);
-    Actor.log.info('Input received', {
-        searchTerms: input.searchTerms,
-        location: input.location,
-        directUrls: input.directUrls,
-        maxResults: input.maxResults,
-        proxy: input.proxyConfig ? 'configured' : 'none',
-    });
+    console.log('[ACTOR] Full input keys:', Object.keys(input));
+    console.log('[ACTOR] location:', input.location, 'maxResults:', input.maxResults);
 
     const {
         searchTerms = [],
@@ -55,6 +50,8 @@ try {
         proxyConfig,
     } = input;
 
+    console.log('[ACTOR] Destructured OK. searchTerms:', searchTerms.length, 'location:', location, 'directUrls:', directUrls.length);
+
     // Validate
     if (searchTerms.length === 0 && directUrls.length === 0) {
         throw new Error('Provide either searchTerms (with location) or directUrls.');
@@ -63,6 +60,7 @@ try {
         throw new Error('location is required when using searchTerms.');
     }
 
+    console.log('[ACTOR] Validation passed');
     console.log('[ACTOR] Charging actor-start event...');
     await Actor.charge({ eventName: 'actor-start', count: 1 }).catch(e => {
         console.log('[ACTOR] charge() warning (expected if not configured):', e.message);
@@ -315,10 +313,12 @@ try {
     Actor.log.info(`Scraping completed. Total results: ${totalResults}`);
 
 } catch (error) {
-    Actor.log.error(`Actor failed: ${error.message}`);
-    Actor.log.error(error.stack);
+    console.error('[ACTOR] CAUGHT ERROR:', error.message);
+    console.error('[ACTOR] Stack:', error.stack);
+    try { Actor.log.error(`Actor failed: ${error.message}`); } catch {}
     throw error;
 } finally {
+    console.log('[ACTOR] In finally block, calling Actor.exit()...');
     await Actor.exit();
 }
 
