@@ -270,13 +270,15 @@ try {
 
         // Visit each place and extract details
         let results = [];
+        // Collect websites for batch email enrichment after extraction
+        const emailQueue = []; // { index, website }
+
         for (let j = 0; j < placeLinks.length; j++) {
             try {
                 await page.goto(placeLinks[j], { waitUntil: 'domcontentloaded' });
-                await sleep(1500);
 
-                // Wait for heading
-                await page.waitForSelector('h1, [role="main"] h1', { timeout: 10000 }).catch(() => {});
+                // Wait for heading (reduced timeout)
+                await page.waitForSelector('h1, [role="main"] h1', { timeout: 5000 }).catch(() => {});
 
                 const html = await page.content();
                 const dom = new JSDOM(html);
@@ -311,35 +313,44 @@ try {
                 if (liveData.email) {
                     placeData.emails = [liveData.email];
                 }
-
-                // Email enrichment: crawl the business website for emails
-                if (scrapeEmails && placeData.website && !placeData.emails?.length) {
-                    try {
-                        const websiteEmails = await scrapeEmailsFromWebsite(page, placeData.website);
-                        if (websiteEmails.length > 0) {
-                            placeData.emails = websiteEmails;
-                        }
-                    } catch (e) {
-                        log(`WARNING: Email enrichment failed for ${placeData.website}: ${e.message}`);
-                    }
-                    // Navigate back to Maps place page for next iteration
-                    await page.goto(placeLinks[j], { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-                    await sleep(500);
-                }
-
                 if (!placeData.emails) placeData.emails = [];
 
                 const normalized = DataExtractor.normalizeData(placeData);
                 results.push(normalized);
 
-                if ((j + 1) % 5 === 0) {
-                    log(`  Extracted ${j + 1}/${placeLinks.length} places`);
+                // Queue website for email enrichment (done after all places)
+                if (scrapeEmails && normalized.website && normalized.emails.length === 0) {
+                    emailQueue.push({ index: results.length - 1, website: normalized.website });
                 }
 
-                await sleep(300 + Math.random() * 400);
+                if ((j + 1) % 10 === 0) {
+                    log(`  Extracted ${j + 1}/${placeLinks.length} places`);
+                }
             } catch (e) {
                 log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
             }
+        }
+
+        // --- Email enrichment (uses fetch, not browser — much faster) ---
+        if (emailQueue.length > 0) {
+            log(`Enriching emails for ${emailQueue.length} places with websites...`);
+            // Process in parallel batches of 5
+            for (let b = 0; b < emailQueue.length; b += 5) {
+                const batch = emailQueue.slice(b, b + 5);
+                const emailResults = await Promise.allSettled(
+                    batch.map(item => scrapeEmailsFromWebsite(item.website))
+                );
+                for (let k = 0; k < batch.length; k++) {
+                    if (emailResults[k].status === 'fulfilled' && emailResults[k].value.length > 0) {
+                        results[batch[k].index].emails = emailResults[k].value;
+                    }
+                }
+                if (b + 5 < emailQueue.length) {
+                    log(`  Email batch ${Math.floor(b / 5) + 1}: ${Math.min(b + 5, emailQueue.length)}/${emailQueue.length} done`);
+                }
+            }
+            const withEmails = results.filter(r => r.emails.length > 0).length;
+            log(`Email enrichment complete: found emails for ${withEmails}/${results.length} places`);
         }
 
         // Apply filters
@@ -594,13 +605,12 @@ async function extractLiveData(page) {
 
 /**
  * Crawl a business website to find contact email addresses.
- * Checks the homepage and common contact page paths.
+ * Uses HTTP fetch (not browser) for speed. Checks homepage + contact pages.
  */
-async function scrapeEmailsFromWebsite(page, websiteUrl) {
+async function scrapeEmailsFromWebsite(websiteUrl) {
     const emails = new Set();
     const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
-    // Normalize URL
     let baseUrl;
     try {
         baseUrl = new URL(websiteUrl);
@@ -608,52 +618,57 @@ async function scrapeEmailsFromWebsite(page, websiteUrl) {
         return [];
     }
 
-    // Pages to check for emails
-    const pagesToCheck = [
-        baseUrl.href,  // Homepage
-    ];
-    // Common contact page paths
-    for (const path of ['/contact', '/contact-us', '/about', '/about-us']) {
+    const pagesToCheck = [baseUrl.href];
+    for (const path of ['/contact', '/contact-us']) {
         pagesToCheck.push(new URL(path, baseUrl).href);
     }
 
     for (const url of pagesToCheck) {
         try {
-            const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
-            if (!response || response.status() >= 400) continue;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            const resp = await fetch(url, {
+                signal: controller.signal,
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MapScraper/2.0)' },
+                redirect: 'follow',
+            });
+            clearTimeout(timeout);
+            if (!resp.ok) continue;
 
-            // Extract emails from page content
-            const pageEmails = await page.evaluate((regex) => {
-                const found = [];
-                // Check mailto links
-                document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
-                    const email = a.href.replace('mailto:', '').split('?')[0].trim();
-                    if (email) found.push(email);
-                });
-                // Check visible text
-                const bodyText = document.body?.innerText || '';
-                const matches = bodyText.match(new RegExp(regex, 'g')) || [];
-                found.push(...matches);
-                return found;
-            }, EMAIL_REGEX.source);
+            const html = await resp.text();
 
-            for (const email of pageEmails) {
-                const clean = email.toLowerCase().trim();
-                // Filter out common false positives
-                if (clean.includes('@example') ||
-                    clean.includes('@test') ||
-                    clean.includes('@sentry') ||
-                    clean.includes('.png') ||
-                    clean.includes('.jpg') ||
-                    clean.includes('@2x') ||
-                    clean.length > 80) continue;
-                emails.add(clean);
+            // Extract mailto: links
+            const mailtoMatches = html.match(/mailto:([^"'\s?]+)/gi) || [];
+            for (const m of mailtoMatches) {
+                const email = m.replace(/^mailto:/i, '').split('?')[0].trim();
+                if (email) emails.add(email.toLowerCase());
             }
 
-            // If we found emails on this page, no need to check more
+            // Extract emails from page text
+            const textMatches = html.match(EMAIL_REGEX) || [];
+            for (const email of textMatches) {
+                emails.add(email.toLowerCase());
+            }
+
+            // Filter out false positives
+            for (const email of emails) {
+                if (email.includes('@example') ||
+                    email.includes('@test') ||
+                    email.includes('@sentry') ||
+                    email.includes('@wix') ||
+                    email.includes('.png') ||
+                    email.includes('.jpg') ||
+                    email.includes('@2x') ||
+                    email.endsWith('.js') ||
+                    email.endsWith('.css') ||
+                    email.length > 80) {
+                    emails.delete(email);
+                }
+            }
+
             if (emails.size > 0) break;
         } catch {
-            // Page didn't load, skip it
+            // Timeout or fetch error, skip
         }
     }
 
