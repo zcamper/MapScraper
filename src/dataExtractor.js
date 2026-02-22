@@ -405,6 +405,7 @@ export class DataExtractor {
       reservationLinks: Array.isArray(data.reservationLinks) ? data.reservationLinks : [],
       amenities: data.amenities || {},
       imageCount: data.imageCount || 0,
+      emails: Array.isArray(data.emails) ? data.emails : [],
     };
   }
 }

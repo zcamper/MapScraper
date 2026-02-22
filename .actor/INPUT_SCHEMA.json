@@ -65,6 +65,12 @@
             "description": "Extract opening hours for each place",
             "default": true
         },
+        "scrapeEmails": {
+            "title": "Scrape Emails from Websites",
+            "type": "boolean",
+            "description": "Visit each business's website to find contact email addresses. Adds ~5 seconds per place but provides valuable lead data.",
+            "default": true
+        },
         "minRating": {
             "title": "Minimum Rating Filter",
             "type": "number",

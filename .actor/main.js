@@ -56,6 +56,7 @@ try {
         scrapeReviews = true,
         reviewsLimit = 5,
         scrapeOpeningHours = true,
+        scrapeEmails = true,
         minRating,
         status,
         language = 'en',
@@ -306,6 +307,27 @@ try {
                 if (liveData.address && !placeData.address?.fullAddress) {
                     placeData.address = { ...placeData.address, fullAddress: liveData.address };
                 }
+                // Grab email from Maps page if available
+                if (liveData.email) {
+                    placeData.emails = [liveData.email];
+                }
+
+                // Email enrichment: crawl the business website for emails
+                if (scrapeEmails && placeData.website && !placeData.emails?.length) {
+                    try {
+                        const websiteEmails = await scrapeEmailsFromWebsite(page, placeData.website);
+                        if (websiteEmails.length > 0) {
+                            placeData.emails = websiteEmails;
+                        }
+                    } catch (e) {
+                        log(`WARNING: Email enrichment failed for ${placeData.website}: ${e.message}`);
+                    }
+                    // Navigate back to Maps place page for next iteration
+                    await page.goto(placeLinks[j], { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                    await sleep(500);
+                }
+
+                if (!placeData.emails) placeData.emails = [];
 
                 const normalized = DataExtractor.normalizeData(placeData);
                 results.push(normalized);
@@ -500,9 +522,85 @@ async function extractLiveData(page) {
             if (webEl) result.website = webEl.getAttribute('href') || '';
             const addrEl = document.querySelector('[data-item-id="address"] .Io6YTe, [data-item-id="address"] .rogA2c');
             if (addrEl) result.address = addrEl.textContent.trim();
+            // Check for email on the Maps page (rare but some businesses list it)
+            const emailEl = document.querySelector('[data-item-id*="email"] .Io6YTe, [data-item-id*="email"] .rogA2c');
+            if (emailEl) result.email = emailEl.textContent.trim();
+            // Also scan all text for mailto: links
+            const mailtoLinks = document.querySelectorAll('a[href^="mailto:"]');
+            if (mailtoLinks.length > 0) {
+                result.email = result.email || mailtoLinks[0].href.replace('mailto:', '').split('?')[0];
+            }
             return result;
         });
     } catch { return {}; }
+}
+
+/**
+ * Crawl a business website to find contact email addresses.
+ * Checks the homepage and common contact page paths.
+ */
+async function scrapeEmailsFromWebsite(page, websiteUrl) {
+    const emails = new Set();
+    const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+
+    // Normalize URL
+    let baseUrl;
+    try {
+        baseUrl = new URL(websiteUrl);
+    } catch {
+        return [];
+    }
+
+    // Pages to check for emails
+    const pagesToCheck = [
+        baseUrl.href,  // Homepage
+    ];
+    // Common contact page paths
+    for (const path of ['/contact', '/contact-us', '/about', '/about-us']) {
+        pagesToCheck.push(new URL(path, baseUrl).href);
+    }
+
+    for (const url of pagesToCheck) {
+        try {
+            const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+            if (!response || response.status() >= 400) continue;
+
+            // Extract emails from page content
+            const pageEmails = await page.evaluate((regex) => {
+                const found = [];
+                // Check mailto links
+                document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
+                    const email = a.href.replace('mailto:', '').split('?')[0].trim();
+                    if (email) found.push(email);
+                });
+                // Check visible text
+                const bodyText = document.body?.innerText || '';
+                const matches = bodyText.match(new RegExp(regex, 'g')) || [];
+                found.push(...matches);
+                return found;
+            }, EMAIL_REGEX.source);
+
+            for (const email of pageEmails) {
+                const clean = email.toLowerCase().trim();
+                // Filter out common false positives
+                if (clean.includes('@example') ||
+                    clean.includes('@test') ||
+                    clean.includes('@sentry') ||
+                    clean.includes('.png') ||
+                    clean.includes('.jpg') ||
+                    clean.includes('@2x') ||
+                    clean.length > 80) continue;
+                emails.add(clean);
+            }
+
+            // If we found emails on this page, no need to check more
+            if (emails.size > 0) break;
+        } catch {
+            // Page didn't load, skip it
+        }
+    }
+
+    return Array.from(emails);
 }
 
 async function saveScreenshot(page, label) {
