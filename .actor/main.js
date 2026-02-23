@@ -118,27 +118,30 @@ try {
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     };
 
-    log(`Launching browser (${proxyUrl ? 'via proxy' : 'direct connection'})...`);
+    log('Launching browser...');
     const browser = await chromium.launch({ headless: true });
-    let context = await browser.newContext({ ...contextOpts, proxy: proxyUrl ? { server: proxyUrl } : undefined });
+
+    // Always try direct connection first — it's faster and the Apify proxy is often unreliable.
+    // Fall back to proxy only if direct navigation fails (e.g. Google blocks the server IP).
+    log('Navigating to Google Maps (direct)...');
+    let context = await browser.newContext(contextOpts);
     let page = await context.newPage();
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(60000);
 
-    log('Navigating to Google Maps...');
-    let navOk = await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+    let navOk = await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
         .then(() => true).catch(() => false);
 
     if (!navOk && proxyUrl) {
-        log('Proxy navigation failed — retrying with direct connection (no proxy)...');
+        log('Direct navigation failed — retrying with proxy...');
         await context.close();
-        context = await browser.newContext(contextOpts);
+        context = await browser.newContext({ ...contextOpts, proxy: { server: proxyUrl } });
         page = await context.newPage();
         page.setDefaultTimeout(30000);
         page.setDefaultNavigationTimeout(60000);
         await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } else if (!navOk) {
-        // No proxy to fall back to — try once more
+        // No proxy available — try once more
         await sleep(3000);
         await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     }
@@ -235,7 +238,7 @@ try {
         }
 
         log(`Search page URL: ${page.url()}`);
-        await saveScreenshot(page, `step-3-search-${i}`);
+        await saveScreenshot(page, `step-3-search-${searchNum}`);
 
         // Detect brand-name searches that redirect straight to a single place page
         // (e.g. "Rehlko Generator" → google.com/maps/place/Rehlko+Power+Systems/...)
@@ -256,7 +259,7 @@ try {
                     document.body?.innerText?.substring(0, 500) || 'empty'
                 );
                 log(`Page text preview: ${bodyText.substring(0, 300)}`);
-                await saveScreenshot(page, `step-4-no-results-${i}`);
+                await saveScreenshot(page, `step-4-no-results-${searchNum}`);
                 continue;
             }
 
@@ -273,7 +276,7 @@ try {
                 const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
                 await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
                 await sleep(4000);
-                await saveScreenshot(page, `step-3b-retry-${i}`);
+                await saveScreenshot(page, `step-3b-retry-${searchNum}`);
 
                 hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
                     .then(() => true).catch(() => false);
@@ -288,7 +291,7 @@ try {
             }
 
             if (placeLinks.length === 0) {
-                await saveScreenshot(page, `step-5-no-links-${i}`);
+                await saveScreenshot(page, `step-5-no-links-${searchNum}`);
                 continue;
             }
         }
