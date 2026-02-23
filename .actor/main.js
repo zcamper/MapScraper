@@ -67,6 +67,7 @@ try {
         minRating,
         status,
         language = 'en',
+        proxyConfig,
     } = input;
 
     // Normalise into a single list. `locations` array takes priority; fall back to
@@ -91,19 +92,33 @@ try {
         await Actor.charge({ eventName: 'actor-start', count: 1 });
     } catch {}
 
-    // --- Launch browser directly (no proxy — it always times out on Google Maps) ---
+    // --- Proxy Configuration ---
+    let proxyUrl;
+    if (proxyConfig) {
+        try {
+            const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
+            if (proxyConfiguration) {
+                proxyUrl = await proxyConfiguration.newUrl();
+                log(`Using proxy configuration: ${proxyUrl.split('@')[1] || 'configured'}`);
+            }
+        } catch (e) {
+            logErr(`Failed to configure proxy: ${e.message}`);
+        }
+    }
+
     log('Importing Playwright...');
     const pw = await import('playwright');
     chromium = pw.chromium;
     log('Playwright imported');
 
     const mapsUrl = 'https://www.google.com/maps/?hl=' + language;
-    log('Launching browser (direct connection)...');
+    log(`Launching browser (${proxyUrl ? 'via proxy' : 'direct connection'})...`);
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
         viewport: { width: 1280, height: 720 },
         locale: language,
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        proxy: proxyUrl ? { server: proxyUrl } : undefined,
     });
     const page = await context.newPage();
     page.setDefaultTimeout(30000);
@@ -285,18 +300,13 @@ try {
         const termDeadline = Date.now() + Math.max(termTimeLimit, 25_000);
         log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${totalRemainingSearches} searches after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
 
-        // Pre-trim to only attempt as many places as the budget can cover (~8s/place).
-        // Avoids hitting the mid-loop early-exit and makes progress visible up front.
-        const msForExtraction = termDeadline - Date.now();
-        const maxExtractable = Math.max(Math.floor(msForExtraction / 8_000), 1);
-        const newLinksTrimmed = newLinks.slice(0, maxExtractable);
-        if (newLinksTrimmed.length < newLinks.length) {
-            log(`Pre-trimming to ${newLinksTrimmed.length}/${newLinks.length} places (budget: ${Math.round(msForExtraction / 1000)}s)`);
-        }
+        // Use all found links; do not pre-trim based on estimates.
+        const newLinksTrimmed = newLinks;
 
         for (let j = 0; j < newLinksTrimmed.length; j++) {
-            if (Date.now() + 5_000 > termDeadline) {
-                log(`Term time limit reached at ${j}/${newLinksTrimmed.length} (${remaining()}ms total left)`);
+            // Check if we are critically low on global time (leave 10s buffer)
+            if (!timeOk(10_000)) {
+                log(`Global time limit reached at ${j}/${newLinksTrimmed.length} (${remaining()}ms left)`);
                 break;
             }
 
