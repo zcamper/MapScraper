@@ -112,26 +112,36 @@ try {
     log('Playwright imported');
 
     const mapsUrl = 'https://www.google.com/maps/?hl=' + language;
-    log(`Launching browser (${proxyUrl ? 'via proxy' : 'direct connection'})...`);
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
+    const contextOpts = {
         viewport: { width: 1280, height: 720 },
         locale: language,
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        proxy: proxyUrl ? { server: proxyUrl } : undefined,
-    });
-    const page = await context.newPage();
+    };
+
+    log(`Launching browser (${proxyUrl ? 'via proxy' : 'direct connection'})...`);
+    const browser = await chromium.launch({ headless: true });
+    let context = await browser.newContext({ ...contextOpts, proxy: proxyUrl ? { server: proxyUrl } : undefined });
+    let page = await context.newPage();
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(60000);
 
     log('Navigating to Google Maps...');
-    // Use a longer timeout for the initial load — proxy cold-start can be slow
-    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
-        .catch(async (err) => {
-            log(`Initial navigation failed (${err.message.split('\n')[0]}) — retrying...`);
-            await sleep(3000);
-            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        });
+    let navOk = await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        .then(() => true).catch(() => false);
+
+    if (!navOk && proxyUrl) {
+        log('Proxy navigation failed — retrying with direct connection (no proxy)...');
+        await context.close();
+        context = await browser.newContext(contextOpts);
+        page = await context.newPage();
+        page.setDefaultTimeout(30000);
+        page.setDefaultNavigationTimeout(60000);
+        await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } else if (!navOk) {
+        // No proxy to fall back to — try once more
+        await sleep(3000);
+        await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    }
     await sleep(2000);
     log(`Landed on: ${page.url()} (title: "${await page.title()}")`);
     log(`Startup took ${elapsed()}ms`);
