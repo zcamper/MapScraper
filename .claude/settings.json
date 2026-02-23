@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(\"/c/Program Files \\(x86\\)/GitHub CLI/gh.exe\" auth status)",
+      "Bash(cmd //c \"gh auth status\")",
+      "Bash(cmd //c \"gh repo create MapScraper --public --description \"\"Google Maps Scraper with CLI, Apify Actor, REST API, and Lead Gen SaaS\"\" --source=z:\\\\MapScraper --push\")",
+      "Bash(# Find gh.exe find \"\"/c/Program Files\"\" \"\"/c/Program Files \\(x86\\)\"\" \"\"/c/Users/Zacha\"\" -name \"\"gh.exe\"\")",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" repo create MapScraper --public --description \"Google Maps Scraper with CLI, Apify Actor, REST API, and Lead Gen SaaS\" --source . --push)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" repo view zcamper/MapScraper)",
+      "WebFetch(domain:crawlee.dev)",
+      "WebFetch(domain:scrapfly.io)",
+      "WebFetch(domain:stackademic.com)",
+      "WebFetch(domain:hasdata.com)",
+      "WebFetch(domain:danters1997.medium.com)",
+      "WebFetch(domain:www.zenrows.com)",
+      "WebFetch(domain:scrap.io)",
+      "WebFetch(domain:decodo.com)",
+      "WebFetch(domain:rayobyte.com)",
+      "WebFetch(domain:brightdata.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:expertbeacon.com)",
+      "WebFetch(domain:www.scrapehero.com)",
+      "WebFetch(domain:www.scraperapi.com)"
+    ],
+    "additionalDirectories": [
+      "Z:\\MapScraper\\webapp\\data"
+    ]
+  }
+}

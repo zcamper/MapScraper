@@ -193,52 +193,60 @@ try {
         log(`Search page URL: ${page.url()}`);
         await saveScreenshot(page, `step-3-search-${i}`);
 
-        // Wait for results
-        log('Waiting for place links...');
-        let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
-            .then(() => true)
-            .catch(() => false);
+        // Detect brand-name searches that redirect straight to a single place page
+        // (e.g. "Rehlko Generator" → google.com/maps/place/Rehlko+Power+Systems/...)
+        let placeLinks;
+        if (page.url().includes('/maps/place/') && !page.url().includes('/maps/search/')) {
+            log('Search redirected to single place page — extracting directly');
+            placeLinks = [page.url()];
+        } else {
+            // Normal search results flow
+            log('Waiting for place links...');
+            let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
+                .then(() => true)
+                .catch(() => false);
 
-        if (!hasResults) {
-            log('WARNING: No place links found on search results page');
-            const bodyText = await page.evaluate(() =>
-                document.body?.innerText?.substring(0, 500) || 'empty'
-            );
-            log(`Page text preview: ${bodyText.substring(0, 300)}`);
-            await saveScreenshot(page, `step-4-no-results-${i}`);
-            continue;
-        }
+            if (!hasResults) {
+                log('WARNING: No place links found on search results page');
+                const bodyText = await page.evaluate(() =>
+                    document.body?.innerText?.substring(0, 500) || 'empty'
+                );
+                log(`Page text preview: ${bodyText.substring(0, 300)}`);
+                await saveScreenshot(page, `step-4-no-results-${i}`);
+                continue;
+            }
 
-        log('Place links found! Collecting results...');
+            log('Place links found! Collecting results...');
 
-        // Scroll and collect place links
-        let placeLinks = await scrollAndCollect(page, maxResults);
-        log(`Collected ${placeLinks.length} place links`);
+            // Scroll and collect place links
+            placeLinks = await scrollAndCollect(page, maxResults);
+            log(`Collected ${placeLinks.length} place links`);
 
-        // If we got very few results, retry with URL method as fallback
-        if (placeLinks.length < 10 && timeOk(120_000)) {
-            log(`Only ${placeLinks.length} results — retrying with URL-based search...`);
-            const searchQuery = encodeURIComponent(fullQuery);
-            const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(4000);
-            await saveScreenshot(page, `step-3b-retry-${i}`);
+            // If we got very few results, retry with URL method as fallback
+            if (placeLinks.length < 10 && timeOk(120_000)) {
+                log(`Only ${placeLinks.length} results — retrying with URL-based search...`);
+                const searchQuery = encodeURIComponent(fullQuery);
+                const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
+                await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+                await sleep(4000);
+                await saveScreenshot(page, `step-3b-retry-${i}`);
 
-            hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
-                .then(() => true).catch(() => false);
-            if (hasResults) {
-                const retryLinks = await scrollAndCollect(page, maxResults);
-                log(`URL retry collected ${retryLinks.length} place links`);
-                if (retryLinks.length > placeLinks.length) {
-                    placeLinks = retryLinks;
-                    log(`Using URL method results (${placeLinks.length} > previous ${placeLinks.length})`);
+                hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
+                    .then(() => true).catch(() => false);
+                if (hasResults) {
+                    const retryLinks = await scrollAndCollect(page, maxResults);
+                    log(`URL retry collected ${retryLinks.length} place links`);
+                    if (retryLinks.length > placeLinks.length) {
+                        placeLinks = retryLinks;
+                        log(`Using URL method results (${placeLinks.length} > previous ${placeLinks.length})`);
+                    }
                 }
             }
-        }
 
-        if (placeLinks.length === 0) {
-            await saveScreenshot(page, `step-5-no-links-${i}`);
-            continue;
+            if (placeLinks.length === 0) {
+                await saveScreenshot(page, `step-5-no-links-${i}`);
+                continue;
+            }
         }
 
         // Filter out places already extracted by previous search terms
@@ -251,23 +259,33 @@ try {
         const avgTimePerPlace = [];
         const emailJobs = []; // { idx, promise } — fire concurrently, resolve after loop
 
-        // Dynamic time budget: reserve 15s per future term (search + scroll overhead;
-        // extraction is fast due to dedup). Give the rest to this term.
+        // Dynamic time budget: reserve 25s per future term (realistic navigation + scroll
+        // overhead per term; extraction shrinks over time due to dedup).
+        // Always give the current term at least 25s so it can extract a few places.
         const remainingTerms = searchTerms.length - i - 1;
-        const reserveForFuture = remainingTerms * 15_000;
+        const reserveForFuture = remainingTerms * 25_000;
         const termTimeLimit = remaining() - reserveForFuture - 5_000;
-        const termDeadline = Date.now() + Math.max(termTimeLimit, 10_000);
-        log(`Term budget: ${Math.round(termTimeLimit / 1000)}s for extraction (${remainingTerms} terms after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
+        const termDeadline = Date.now() + Math.max(termTimeLimit, 25_000);
+        log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${remainingTerms} terms after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
 
-        for (let j = 0; j < newLinks.length; j++) {
+        // Pre-trim to only attempt as many places as the budget can cover (~8s/place).
+        // Avoids hitting the mid-loop early-exit and makes progress visible up front.
+        const msForExtraction = termDeadline - Date.now();
+        const maxExtractable = Math.max(Math.floor(msForExtraction / 8_000), 1);
+        const newLinksTrimmed = newLinks.slice(0, maxExtractable);
+        if (newLinksTrimmed.length < newLinks.length) {
+            log(`Pre-trimming to ${newLinksTrimmed.length}/${newLinks.length} places (budget: ${Math.round(msForExtraction / 1000)}s)`);
+        }
+
+        for (let j = 0; j < newLinksTrimmed.length; j++) {
             if (Date.now() + 5_000 > termDeadline) {
-                log(`Term time limit reached at ${j}/${newLinks.length} (${remaining()}ms total left)`);
+                log(`Term time limit reached at ${j}/${newLinksTrimmed.length} (${remaining()}ms total left)`);
                 break;
             }
 
             const placeStart = Date.now();
             try {
-                await page.goto(newLinks[j], { waitUntil: 'commit' });
+                await page.goto(newLinksTrimmed[j], { waitUntil: 'commit' });
                 await page.waitForSelector('h1', { timeout: 3000 }).catch(() => {});
 
                 // Extract everything from the live DOM in one evaluate call
@@ -371,7 +389,7 @@ try {
                 if (!data.placeName) continue;
 
                 // Reviews — only if enough time within this term's budget
-                const remainingPlaces = newLinks.length - j - 1;
+                const remainingPlaces = newLinksTrimmed.length - j - 1;
                 const termTimeLeft = termDeadline - Date.now();
                 const canDoReviews = scrapeReviews && reviewsLimit > 0 && termTimeLeft > (remainingPlaces * 3000 + 10_000);
                 if (canDoReviews) {
@@ -397,7 +415,7 @@ try {
                 if (placeIdMatch) {
                     data.placeId = placeIdMatch[1];
                 }
-                data.url = newLinks[j];
+                data.url = newLinksTrimmed[j];
                 data.emails = data.email ? [data.email] : [];
                 delete data.email;
                 data.scrapedAt = new Date().toISOString();
@@ -412,12 +430,12 @@ try {
                 }
 
                 results.push(data);
-                extractedUrls.add(newLinks[j]);
+                extractedUrls.add(newLinksTrimmed[j]);
                 avgTimePerPlace.push(Date.now() - placeStart);
 
-                if ((j + 1) % 5 === 0 || j === newLinks.length - 1) {
+                if ((j + 1) % 5 === 0 || j === newLinksTrimmed.length - 1) {
                     const avgMs = Math.round(avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length);
-                    log(`  Extracted ${j + 1}/${newLinks.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
+                    log(`  Extracted ${j + 1}/${newLinksTrimmed.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
                 }
             } catch (e) {
                 log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
@@ -562,7 +580,7 @@ async function scrollAndCollect(page, maxResults) {
     });
     log(`Scroll container: ${containerInfo ? `${containerInfo.selector} (${containerInfo.scrollHeight}h / ${containerInfo.clientHeight}ch)` : 'not found'}`);
 
-    while (placeLinks.size < maxResults && scrollAttempts < 100 && timeOk(60_000)) {
+    while (placeLinks.size < maxResults && scrollAttempts < 100 && timeOk(10_000)) {
         // Collect all visible place links
         const links = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('a[href*="/maps/place/"]'))
