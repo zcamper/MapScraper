@@ -3,8 +3,10 @@
  *
  * Key optimizations:
  * - Skips proxy (always fails on Apify for Google Maps, wastes 15s)
- * - Time-budget aware: pushes results incrementally, skips reviews if running low
- * - Fast extraction: waitUntil 'commit', short h1 timeout, single page.evaluate
+ * - Concurrent email enrichment: HTTP fetches run in background during extraction
+ * - Dedup across search terms: skips places already extracted
+ * - Time-budget aware: reserves time for remaining search terms, skips reviews if tight
+ * - Fast extraction: waitUntil 'commit', 2s h1 timeout, single page.evaluate
  */
 
 // Synchronous flush helper - ensures log output is visible before process dies
@@ -129,6 +131,7 @@ try {
     const { filterByRating, filterByStatus } = await import('../src/utils.js');
 
     let totalResults = 0;
+    const extractedUrls = new Set(); // Dedup across search terms
 
     // --- Process search terms ---
     for (let i = 0; i < searchTerms.length; i++) {
@@ -238,28 +241,29 @@ try {
             continue;
         }
 
+        // Filter out places already extracted by previous search terms
+        const newLinks = placeLinks.filter(url => !extractedUrls.has(url));
+        const skipped = placeLinks.length - newLinks.length;
+        if (skipped > 0) log(`Skipping ${skipped} already-extracted places, ${newLinks.length} new`);
+
         // Visit each place and extract data
         let results = [];
-        const avgTimePerPlace = []; // Track actual time per place
+        const avgTimePerPlace = [];
+        const emailJobs = []; // { idx, promise } — fire concurrently, resolve after loop
 
-        for (let j = 0; j < placeLinks.length; j++) {
-            // Time check: need at least 10s per remaining place + 30s for email enrichment + cleanup
-            const remainingPlaces = placeLinks.length - j;
-            const avgTime = avgTimePerPlace.length > 0
-                ? avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length
-                : 5000;
-            const estimatedNeeded = remainingPlaces * Math.min(avgTime, 8000) + 30_000;
-
-            if (!timeOk(10_000)) {
-                log(`Time budget exhausted at place ${j + 1}/${placeLinks.length} (${remaining()}ms left), stopping extraction`);
+        for (let j = 0; j < newLinks.length; j++) {
+            // Time check: reserve time for email resolution + remaining search terms
+            const remainingTerms = searchTerms.length - i - 1;
+            const timeForRemainingTerms = remainingTerms * 35_000; // ~35s per term
+            if (!timeOk(10_000 + timeForRemainingTerms)) {
+                log(`Time budget: ${remaining()}ms left, ${remainingTerms} terms remaining — stopping at ${j}/${newLinks.length}`);
                 break;
             }
 
             const placeStart = Date.now();
             try {
-                await page.goto(placeLinks[j], { waitUntil: 'commit' });
-                // Short wait for heading — don't block for 8s
-                await page.waitForSelector('h1', { timeout: 4000 }).catch(() => {});
+                await page.goto(newLinks[j], { waitUntil: 'commit' });
+                await page.waitForSelector('h1', { timeout: 2000 }).catch(() => {});
 
                 // Extract everything from the live DOM in one evaluate call
                 const data = await page.evaluate(() => {
@@ -282,13 +286,12 @@ try {
                     // Category
                     const catBtn = document.querySelector('button[jsaction*="category"]');
                     r.category = catBtn?.textContent?.trim() || '';
-                    // Phone — try multiple selectors
+                    // Phone
                     const phoneEl = document.querySelector('[data-item-id*="phone"] .Io6YTe, [data-item-id*="phone"] .rogA2c, button[data-item-id*="phone:tel:"] .fontBodyMedium');
                     r.phoneNumber = phoneEl?.textContent?.trim() || '';
-                    // Website — try multiple selectors
+                    // Website
                     const webEl = document.querySelector('[data-item-id="authority"] a, a[data-item-id="authority"], a[aria-label*="Website" i], a[data-tooltip="Open website"]');
                     r.website = webEl?.getAttribute('href') || '';
-                    // If still no website, scan all links for non-google external links
                     if (!r.website) {
                         const allLinks = document.querySelectorAll('a[href]');
                         for (const a of allLinks) {
@@ -362,11 +365,9 @@ try {
 
                 if (!data.placeName) continue;
 
-                // Extract reviews only if time budget allows extracting ALL remaining places
-                // Reviews add ~4s per place, so skip them if time is tight
-                const remainingPlaces = placeLinks.length - j - 1;
-                const timePerPlaceBase = 4000; // base time without reviews
-                const timeNeeded = remainingPlaces * timePerPlaceBase + 30_000; // + email enrichment buffer
+                // Reviews — only if ample time for remaining places + remaining search terms
+                const remainingPlaces = newLinks.length - j - 1;
+                const timeNeeded = remainingPlaces * 3000 + timeForRemainingTerms + 20_000;
                 const canDoReviews = scrapeReviews && reviewsLimit > 0 && remaining() > timeNeeded + 5000;
                 if (canDoReviews) {
                     try {
@@ -391,34 +392,27 @@ try {
                 if (placeIdMatch) {
                     data.placeId = placeIdMatch[1];
                 }
-                data.url = placeLinks[j];
+                data.url = newLinks[j];
                 data.emails = data.email ? [data.email] : [];
                 delete data.email;
                 data.scrapedAt = new Date().toISOString();
 
-                // Email enrichment — MUST happen before pushData so emails appear in dataset
-                if (scrapeEmails && data.website && data.emails.length === 0 && timeOk(30_000)) {
-                    try {
-                        const foundEmails = await scrapeEmailsFromWebsite(data.website);
-                        if (foundEmails.length > 0) data.emails = foundEmails;
-                    } catch {}
+                // Fire off email enrichment concurrently — don't await, resolve after loop
+                // HTTP fetches run in background while we navigate to the next place
+                if (scrapeEmails && data.website && data.emails.length === 0) {
+                    emailJobs.push({
+                        idx: results.length,
+                        promise: scrapeEmailsFromWebsite(data.website).catch(() => [])
+                    });
                 }
 
                 results.push(data);
-
-                // Push data incrementally so we don't lose results on timeout
-                await Actor.pushData(data);
-                try { await Actor.charge({ eventName: 'place-scraped', count: 1 }); } catch {}
-                if (data.reviews?.length > 0) {
-                    try { await Actor.charge({ eventName: 'review-scraped', count: data.reviews.length }); } catch {}
-                }
-
+                extractedUrls.add(newLinks[j]);
                 avgTimePerPlace.push(Date.now() - placeStart);
 
-                if ((j + 1) % 5 === 0) {
+                if ((j + 1) % 5 === 0 || j === newLinks.length - 1) {
                     const avgMs = Math.round(avgTimePerPlace.reduce((a, b) => a + b, 0) / avgTimePerPlace.length);
-                    const emailCount = results.filter(r => r.emails?.length > 0).length;
-                    log(`  Extracted ${j + 1}/${placeLinks.length} places (avg ${avgMs}ms/place, ${emailCount} emails, ${remaining()}ms left)`);
+                    log(`  Extracted ${j + 1}/${newLinks.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
                 }
             } catch (e) {
                 log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
@@ -426,16 +420,44 @@ try {
             }
         }
 
-        // Summary stats
-        const withWebsite = results.filter(r => r.website).length;
-        const withEmails = results.filter(r => r.emails?.length > 0).length;
-        log(`Email stats: ${withWebsite} have websites, ${withEmails} have emails`);
+        // Resolve concurrent email enrichment — most fetches already completed during extraction
+        if (emailJobs.length > 0) {
+            const emailTimeout = Math.max(Math.min(remaining() - 10_000, 15_000), 3_000);
+            log(`Resolving ${emailJobs.length} email lookups (${emailTimeout}ms budget)...`);
+            const settled = await Promise.race([
+                Promise.allSettled(emailJobs.map(j => j.promise)),
+                sleep(emailTimeout).then(() => null)
+            ]);
+            let emailsFound = 0;
+            if (settled) {
+                for (let k = 0; k < emailJobs.length; k++) {
+                    if (settled[k]?.status === 'fulfilled' && settled[k].value.length > 0) {
+                        results[emailJobs[k].idx].emails = settled[k].value;
+                        emailsFound++;
+                    }
+                }
+            }
+            log(`  Emails: ${emailsFound}/${emailJobs.length} websites had emails`);
+        }
 
-        // Apply filters
+        // Apply filters before pushing to dataset
+        const preFilterCount = results.length;
         if (minRating) results = filterByRating(results, minRating);
         if (status) results = filterByStatus(results, status);
+        if (results.length < preFilterCount) log(`Filters removed ${preFilterCount - results.length} places`);
 
-        log(`Extracted ${results.length} places for "${term}"`);
+        // Push filtered results to dataset (emails are now populated)
+        for (const data of results) {
+            await Actor.pushData(data);
+            try { await Actor.charge({ eventName: 'place-scraped', count: 1 }); } catch {}
+            if (data.reviews?.length > 0) {
+                try { await Actor.charge({ eventName: 'review-scraped', count: data.reviews.length }); } catch {}
+            }
+        }
+
+        const withWebsite = results.filter(r => r.website).length;
+        const withEmails = results.filter(r => r.emails?.length > 0).length;
+        log(`Search "${term}": ${results.length} places, ${withWebsite} websites, ${withEmails} emails (${elapsed()}ms total)`);
         totalResults += results.length;
 
         // Navigate back to Maps for the next search term
