@@ -216,7 +216,7 @@ try {
         } else {
             // Normal search results flow
             log('Waiting for place links...');
-            let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 7000 })
+            let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
                 .then(() => true)
                 .catch(() => false);
 
@@ -247,6 +247,11 @@ try {
         const skipped = placeLinks.length - newLinks.length;
         if (skipped > 0) log(`Skipping ${skipped} already-extracted places, ${newLinks.length} new`);
 
+        if (newLinks.length === 0) {
+            log('All collected links already extracted — skipping');
+            continue;
+        }
+
         // Visit each place and extract data
         let results = [];
         const avgTimePerPlace = [];
@@ -266,6 +271,7 @@ try {
         log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${totalRemainingSearches} searches after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
 
         const newLinksTrimmed = newLinks;
+        log(`Extracting ${newLinksTrimmed.length} places...`);
 
         for (let j = 0; j < newLinksTrimmed.length; j++) {
             // Stop if global time is critically low
