@@ -191,36 +191,13 @@ try {
             const searchNum = i * locationsList.length + locIdx + 1;
             log(`[${searchNum}/${totalSearches}] Searching: "${fullQuery}"`);
 
-        // Use the search box like a real user — direct URL navigation often
-        // triggers Google's bot detection and returns very few results
-        // Try multiple search box selectors
-        let searchBoxUsed = false;
-        for (const sel of ['#searchboxinput', 'input[name="q"]', 'input[aria-label*="Search" i]']) {
-            try {
-                const input = page.locator(sel).first();
-                if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
-                    log(`Using search box (${sel})...`);
-                    await input.click();
-                    await input.fill('');
-                    await sleep(100);
-                    // Type character by character for more human-like behavior
-                    await input.fill(fullQuery);
-                    await sleep(200);
-                    await page.keyboard.press('Enter');
-                    await sleep(4000);
-                    searchBoxUsed = true;
-                    break;
-                }
-            } catch {}
-        }
-
-        if (!searchBoxUsed) {
-            log('Search box not found, using URL method...');
-            const searchQuery = encodeURIComponent(fullQuery);
-            const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(3000);
-        }
+        // Navigate directly to the search URL — faster and more predictable than
+        // reusing the search box (which requires the old page to reload, adding ~10s overhead).
+        const searchQuery = encodeURIComponent(fullQuery);
+        const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
+        log(`Navigating to search URL...`);
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(2000);
 
         // Handle consent if needed
         if (page.url().includes('consent.google')) {
@@ -249,7 +226,7 @@ try {
         } else {
             // Normal search results flow
             log('Waiting for place links...');
-            let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 15000 })
+            let hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 7000 })
                 .then(() => true)
                 .catch(() => false);
 
@@ -268,27 +245,6 @@ try {
             // Scroll and collect place links
             placeLinks = await scrollAndCollect(page, maxResults);
             log(`Collected ${placeLinks.length} place links`);
-
-            // If we got very few results, retry with URL method as fallback
-            if (placeLinks.length < 10 && timeOk(120_000)) {
-                log(`Only ${placeLinks.length} results — retrying with URL-based search...`);
-                const searchQuery = encodeURIComponent(fullQuery);
-                const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
-                await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-                await sleep(4000);
-                await saveScreenshot(page, `step-3b-retry-${searchNum}`);
-
-                hasResults = await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 10000 })
-                    .then(() => true).catch(() => false);
-                if (hasResults) {
-                    const retryLinks = await scrollAndCollect(page, maxResults);
-                    log(`URL retry collected ${retryLinks.length} place links`);
-                    if (retryLinks.length > placeLinks.length) {
-                        placeLinks = retryLinks;
-                        log(`Using URL method results (${placeLinks.length} > previous ${placeLinks.length})`);
-                    }
-                }
-            }
 
             if (placeLinks.length === 0) {
                 await saveScreenshot(page, `step-5-no-links-${searchNum}`);
