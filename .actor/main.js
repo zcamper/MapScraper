@@ -197,25 +197,15 @@ try {
         const searchUrl = `https://www.google.com/maps/search/${searchQuery}/?hl=${language}`;
         log(`Navigating to search URL...`);
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await sleep(2000);
 
         // Handle consent if needed
         if (page.url().includes('consent.google')) {
             await handleConsent(page);
             await sleep(1500);
-            // Re-navigate to Maps and try again
-            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(2000);
-            const retryInput = page.locator('#searchboxinput');
-            if (await retryInput.isVisible({ timeout: 2000 }).catch(() => false)) {
-                await retryInput.fill(fullQuery);
-                await page.keyboard.press('Enter');
-                await sleep(4000);
-            }
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
         }
 
         log(`Search page URL: ${page.url()}`);
-        await saveScreenshot(page, `step-3-search-${searchNum}`);
 
         // Detect brand-name searches that redirect straight to a single place page
         // (e.g. "Rehlko Generator" → google.com/maps/place/Rehlko+Power+Systems/...)
