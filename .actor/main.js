@@ -268,7 +268,7 @@ try {
             const placeStart = Date.now();
             try {
                 await page.goto(newLinks[j], { waitUntil: 'commit' });
-                await page.waitForSelector('h1', { timeout: 2000 }).catch(() => {});
+                await page.waitForSelector('h1', { timeout: 3000 }).catch(() => {});
 
                 // Extract everything from the live DOM in one evaluate call
                 const data = await page.evaluate(() => {
