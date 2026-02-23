@@ -286,6 +286,7 @@ try {
             }
 
             const placeStart = Date.now();
+            log(`  [${j + 1}/${newLinksTrimmed.length}] Visiting: ${newLinksTrimmed[j].substring(0, 80)}`);
             try {
                 await page.goto(newLinksTrimmed[j], { waitUntil: 'commit' });
                 await page.waitForSelector('h1', { timeout: 3000 }).catch(() => {});
@@ -440,7 +441,7 @@ try {
                     log(`  Extracted ${j + 1}/${newLinksTrimmed.length} places (avg ${avgMs}ms/place, ${remaining()}ms left)`);
                 }
             } catch (e) {
-                log(`WARNING: Failed to extract place ${j + 1}: ${e.message}`);
+                log(`WARNING: Failed to extract place ${j + 1}: ${e?.message || String(e)}`);
                 avgTimePerPlace.push(Date.now() - placeStart);
             }
         }
@@ -485,12 +486,7 @@ try {
         log(`Search "${term}" in "${loc}": ${results.length} places, ${withWebsite} websites, ${withEmails} emails (${elapsed()}ms total)`);
         totalResults += results.length;
 
-        // Navigate back to Maps for the next search (skip on the very last one)
-        const isLastSearch = (i === searchTerms.length - 1) && (locIdx === locationsList.length - 1);
-        if (!isLastSearch && timeOk(30_000)) {
-            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(1500);
-        }
+        // No navigate-back needed — next search uses page.goto(searchUrl) directly
     } // end locations loop
     } // end terms loop
 
