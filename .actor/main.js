@@ -251,12 +251,17 @@ try {
         const avgTimePerPlace = [];
         const emailJobs = []; // { idx, promise } — fire concurrently, resolve after loop
 
+        // Dynamic time budget: reserve 15s per future term (search + scroll overhead;
+        // extraction is fast due to dedup). Give the rest to this term.
+        const remainingTerms = searchTerms.length - i - 1;
+        const reserveForFuture = remainingTerms * 15_000;
+        const termTimeLimit = remaining() - reserveForFuture - 5_000;
+        const termDeadline = Date.now() + Math.max(termTimeLimit, 10_000);
+        log(`Term budget: ${Math.round(termTimeLimit / 1000)}s for extraction (${remainingTerms} terms after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
+
         for (let j = 0; j < newLinks.length; j++) {
-            // Time check: reserve time for email resolution + remaining search terms
-            const remainingTerms = searchTerms.length - i - 1;
-            const timeForRemainingTerms = remainingTerms * 35_000; // ~35s per term
-            if (!timeOk(10_000 + timeForRemainingTerms)) {
-                log(`Time budget: ${remaining()}ms left, ${remainingTerms} terms remaining — stopping at ${j}/${newLinks.length}`);
+            if (Date.now() + 5_000 > termDeadline) {
+                log(`Term time limit reached at ${j}/${newLinks.length} (${remaining()}ms total left)`);
                 break;
             }
 
@@ -365,10 +370,10 @@ try {
 
                 if (!data.placeName) continue;
 
-                // Reviews — only if ample time for remaining places + remaining search terms
+                // Reviews — only if enough time within this term's budget
                 const remainingPlaces = newLinks.length - j - 1;
-                const timeNeeded = remainingPlaces * 3000 + timeForRemainingTerms + 20_000;
-                const canDoReviews = scrapeReviews && reviewsLimit > 0 && remaining() > timeNeeded + 5000;
+                const termTimeLeft = termDeadline - Date.now();
+                const canDoReviews = scrapeReviews && reviewsLimit > 0 && termTimeLeft > (remainingPlaces * 3000 + 10_000);
                 if (canDoReviews) {
                     try {
                         data.reviews = await extractReviews(page, reviewsLimit);
