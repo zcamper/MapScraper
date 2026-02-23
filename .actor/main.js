@@ -141,20 +141,20 @@ try {
     const extractedUrls = new Set(); // Dedup across all locations and search terms
     const totalSearches = locationsList.length * searchTerms.length;
 
-    // --- Process search terms across all locations (cross-join) ---
-    outer: for (let locIdx = 0; locIdx < locationsList.length; locIdx++) {
-        const loc = locationsList[locIdx];
-        if (locationsList.length > 1) log(`--- Location ${locIdx + 1}/${locationsList.length}: "${loc}" ---`);
+    // --- Process in term-first order: all locations for term[0], then term[1], etc.
+    //     This ensures geographic coverage when time runs out before all searches complete.
+    outer: for (let i = 0; i < searchTerms.length; i++) {
+        const term = searchTerms[i];
 
-        for (let i = 0; i < searchTerms.length; i++) {
+        for (let locIdx = 0; locIdx < locationsList.length; locIdx++) {
+            const loc = locationsList[locIdx];
             if (!timeOk(30_000)) {
                 log(`Time budget low (${remaining()}ms), skipping remaining searches`);
                 break outer;
             }
 
-            const term = searchTerms[i];
             const fullQuery = `${term} in ${loc}`;
-            const searchNum = locIdx * searchTerms.length + i + 1;
+            const searchNum = i * locationsList.length + locIdx + 1;
             log(`[${searchNum}/${totalSearches}] Searching: "${fullQuery}"`);
 
         // Use the search box like a real user — direct URL navigation often
@@ -272,15 +272,18 @@ try {
         const avgTimePerPlace = [];
         const emailJobs = []; // { idx, promise } — fire concurrently, resolve after loop
 
-        // Dynamic time budget: reserve 25s per future search across all locations.
-        // Always give the current term at least 25s so it can extract a few places.
+        // Dynamic time budget: estimate how much time to spend on this search.
+        // Remaining searches = remaining locations for this term + all future terms' locations.
+        const remainingLocsThisTerm = locationsList.length - locIdx - 1;
         const remainingTerms = searchTerms.length - i - 1;
-        const remainingLocs = locationsList.length - locIdx - 1;
-        const totalRemainingSearches = remainingTerms + (remainingLocs * searchTerms.length);
-        const reserveForFuture = totalRemainingSearches * 25_000;
+        const totalRemainingSearches = remainingLocsThisTerm + (remainingTerms * locationsList.length);
+        // Reserve 25s per future search, but cap the total reserve at 60% of remaining time
+        // so the current search always gets at least 40% (prevents over-reservation with many searches).
+        const rawReserve = totalRemainingSearches * 25_000;
+        const reserveForFuture = Math.min(rawReserve, remaining() * 0.6);
         const termTimeLimit = remaining() - reserveForFuture - 5_000;
         const termDeadline = Date.now() + Math.max(termTimeLimit, 25_000);
-        log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${remainingTerms} terms after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
+        log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${totalRemainingSearches} searches after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
 
         // Pre-trim to only attempt as many places as the budget can cover (~8s/place).
         // Avoids hitting the mid-loop early-exit and makes progress visible up front.
@@ -503,8 +506,8 @@ try {
             await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
             await sleep(1500);
         }
-    } // end terms loop
     } // end locations loop
+    } // end terms loop
 
     // --- Process direct URLs ---
     for (const directUrl of directUrls) {
