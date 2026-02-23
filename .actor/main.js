@@ -57,6 +57,7 @@ try {
     const {
         searchTerms = [],
         location = '',
+        locations: locationsInput = [],
         directUrls = [],
         maxResults = 120,
         scrapeReviews = true,
@@ -68,14 +69,20 @@ try {
         language = 'en',
     } = input;
 
-    log(`Destructured OK. searchTerms=${searchTerms.length}, location="${location}", directUrls=${directUrls.length}`);
+    // Normalise into a single list. `locations` array takes priority; fall back to
+    // the single `location` string for backwards compatibility.
+    const locationsList = locationsInput.length > 0
+        ? locationsInput
+        : (location ? [location] : []);
+
+    log(`Destructured OK. searchTerms=${searchTerms.length}, locations=${JSON.stringify(locationsList)}, directUrls=${directUrls.length}`);
 
     // Validate
     if (searchTerms.length === 0 && directUrls.length === 0) {
-        throw new Error('Provide either searchTerms (with location) or directUrls.');
+        throw new Error('Provide either searchTerms (with location/locations) or directUrls.');
     }
-    if (searchTerms.length > 0 && !location) {
-        throw new Error('location is required when using searchTerms.');
+    if (searchTerms.length > 0 && locationsList.length === 0) {
+        throw new Error('location (or locations) is required when using searchTerms.');
     }
     log('Validation passed');
 
@@ -131,18 +138,24 @@ try {
     const { filterByRating, filterByStatus } = await import('../src/utils.js');
 
     let totalResults = 0;
-    const extractedUrls = new Set(); // Dedup across search terms
+    const extractedUrls = new Set(); // Dedup across all locations and search terms
+    const totalSearches = locationsList.length * searchTerms.length;
 
-    // --- Process search terms ---
-    for (let i = 0; i < searchTerms.length; i++) {
-        if (!timeOk(30_000)) {
-            log(`Time budget low (${remaining()}ms), skipping remaining search terms`);
-            break;
-        }
+    // --- Process search terms across all locations (cross-join) ---
+    outer: for (let locIdx = 0; locIdx < locationsList.length; locIdx++) {
+        const loc = locationsList[locIdx];
+        if (locationsList.length > 1) log(`--- Location ${locIdx + 1}/${locationsList.length}: "${loc}" ---`);
 
-        const term = searchTerms[i];
-        const fullQuery = `${term} in ${location}`;
-        log(`[${i + 1}/${searchTerms.length}] Searching: "${fullQuery}"`);
+        for (let i = 0; i < searchTerms.length; i++) {
+            if (!timeOk(30_000)) {
+                log(`Time budget low (${remaining()}ms), skipping remaining searches`);
+                break outer;
+            }
+
+            const term = searchTerms[i];
+            const fullQuery = `${term} in ${loc}`;
+            const searchNum = locIdx * searchTerms.length + i + 1;
+            log(`[${searchNum}/${totalSearches}] Searching: "${fullQuery}"`);
 
         // Use the search box like a real user — direct URL navigation often
         // triggers Google's bot detection and returns very few results
@@ -259,11 +272,12 @@ try {
         const avgTimePerPlace = [];
         const emailJobs = []; // { idx, promise } — fire concurrently, resolve after loop
 
-        // Dynamic time budget: reserve 25s per future term (realistic navigation + scroll
-        // overhead per term; extraction shrinks over time due to dedup).
+        // Dynamic time budget: reserve 25s per future search across all locations.
         // Always give the current term at least 25s so it can extract a few places.
         const remainingTerms = searchTerms.length - i - 1;
-        const reserveForFuture = remainingTerms * 25_000;
+        const remainingLocs = locationsList.length - locIdx - 1;
+        const totalRemainingSearches = remainingTerms + (remainingLocs * searchTerms.length);
+        const reserveForFuture = totalRemainingSearches * 25_000;
         const termTimeLimit = remaining() - reserveForFuture - 5_000;
         const termDeadline = Date.now() + Math.max(termTimeLimit, 25_000);
         log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${remainingTerms} terms after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
@@ -480,15 +494,17 @@ try {
 
         const withWebsite = results.filter(r => r.website).length;
         const withEmails = results.filter(r => r.emails?.length > 0).length;
-        log(`Search "${term}": ${results.length} places, ${withWebsite} websites, ${withEmails} emails (${elapsed()}ms total)`);
+        log(`Search "${term}" in "${loc}": ${results.length} places, ${withWebsite} websites, ${withEmails} emails (${elapsed()}ms total)`);
         totalResults += results.length;
 
-        // Navigate back to Maps for the next search term
-        if (i < searchTerms.length - 1 && timeOk(30_000)) {
+        // Navigate back to Maps for the next search (skip on the very last one)
+        const isLastSearch = (i === searchTerms.length - 1) && (locIdx === locationsList.length - 1);
+        if (!isLastSearch && timeOk(30_000)) {
             await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
             await sleep(1500);
         }
-    }
+    } // end terms loop
+    } // end locations loop
 
     // --- Process direct URLs ---
     for (const directUrl of directUrls) {

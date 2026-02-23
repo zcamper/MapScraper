@@ -16,9 +16,15 @@
         "location": {
             "title": "Location",
             "type": "string",
-            "description": "City, region, or country to search in (e.g., 'New York, USA', 'London, UK')",
+            "description": "Single city, region, or country to search in (e.g., 'New York, USA'). Use 'Locations' below to search multiple areas.",
             "editor": "textfield",
             "prefill": "New York, USA"
+        },
+        "locations": {
+            "title": "Locations (multi-location)",
+            "type": "array",
+            "description": "List of cities/regions to search in. Each search term will be run in every location (cross-join). Overrides the single Location field if both are set.",
+            "editor": "stringList"
         },
         "directUrls": {
             "title": "Direct Google Maps URLs",
