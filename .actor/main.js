@@ -122,10 +122,16 @@ try {
     });
     const page = await context.newPage();
     page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(30000);
+    page.setDefaultNavigationTimeout(60000);
 
     log('Navigating to Google Maps...');
-    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+    // Use a longer timeout for the initial load — proxy cold-start can be slow
+    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
+        .catch(async (err) => {
+            log(`Initial navigation failed (${err.message.split('\n')[0]}) — retrying...`);
+            await sleep(3000);
+            await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        });
     await sleep(2000);
     log(`Landed on: ${page.url()} (title: "${await page.title()}")`);
     log(`Startup took ${elapsed()}ms`);
