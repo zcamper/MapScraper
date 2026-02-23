@@ -316,13 +316,17 @@ try {
         const termDeadline = Date.now() + Math.max(termTimeLimit, 25_000);
         log(`Term budget: ${Math.round(Math.max(termTimeLimit, 25_000) / 1000)}s for extraction (${totalRemainingSearches} searches after, ${Math.round(reserveForFuture / 1000)}s reserved)`);
 
-        // Use all found links; do not pre-trim based on estimates.
         const newLinksTrimmed = newLinks;
 
         for (let j = 0; j < newLinksTrimmed.length; j++) {
-            // Check if we are critically low on global time (leave 10s buffer)
+            // Stop if global time is critically low
             if (!timeOk(10_000)) {
                 log(`Global time limit reached at ${j}/${newLinksTrimmed.length} (${remaining()}ms left)`);
+                break;
+            }
+            // Stop if this term's time budget is exhausted (leaves time for remaining searches)
+            if (Date.now() > termDeadline) {
+                log(`Term budget exhausted at ${j}/${newLinksTrimmed.length} (${remaining()}ms global left)`);
                 break;
             }
 
